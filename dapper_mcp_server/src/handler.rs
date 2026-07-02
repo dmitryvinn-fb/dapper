@@ -26,6 +26,7 @@ use dapper_session::Port;
 use dapper_session::ScopeId;
 use dapper_session::SessionId;
 use dapper_session::SessionInfo;
+use dapper_session::SessionStore;
 use rmcp::ErrorData;
 use rmcp::ServerHandler;
 use rmcp::handler::server::tool::ToolCallContext;
@@ -64,6 +65,8 @@ struct CachedClient {
 pub struct McpHandler {
     control_port: Option<Port>,
     scope_id: Option<ScopeId>,
+    /// Where to discover active sessions.
+    sessions: SessionStore,
     tool_router: ToolRouter<McpHandler>,
     config: DapperConfig,
     /// Cached client for connection reuse.
@@ -385,7 +388,12 @@ pub struct ThreadSnapshotRequest {
 
 #[tool_router]
 impl McpHandler {
-    pub fn new(control_port: Option<Port>, scope_id: Option<ScopeId>, toolset: &Toolset) -> Self {
+    pub fn new(
+        control_port: Option<Port>,
+        scope_id: Option<ScopeId>,
+        toolset: &Toolset,
+        sessions: SessionStore,
+    ) -> Self {
         let mut tool_router = Self::tool_router();
 
         // Strip tools not in the active toolset (always-available tools are kept)
@@ -405,6 +413,7 @@ impl McpHandler {
         Self {
             control_port,
             scope_id,
+            sessions,
             tool_router,
             config: DapperConfig::load_or_default(),
             cached_client: Arc::new(RwLock::new(None)),
@@ -424,11 +433,14 @@ impl McpHandler {
     /// Resolve the target session from an optional explicit session ID.
     fn resolve_session(&self, session_id: Option<&SessionId>) -> anyhow::Result<SessionInfo> {
         if let Some(explicit_port) = self.control_port {
-            SessionInfo::iter_active_sessions(self.scope_id.clone())?
+            self.sessions
+                .iter_active_sessions(self.scope_id.clone())
                 .find(|s| s.control_plane_port.map(|p| p.get()) == Some(explicit_port.get()))
                 .ok_or_else(|| anyhow::anyhow!("no session found on port {}", explicit_port.get()))
         } else if let Some(id) = session_id {
-            let session = SessionInfo::find_active_session_with_id(self.scope_id.clone(), id)?
+            let session = self
+                .sessions
+                .find_active_session_with_id(self.scope_id.clone(), id)
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "Session '{}' not found or not active{}.",
@@ -447,17 +459,18 @@ impl McpHandler {
                 })?;
 
                 last.as_ref().and_then(|id| {
-                    SessionInfo::find_active_session_with_id(self.scope_id.clone(), id)
-                        .ok()
-                        .flatten()
+                    self.sessions
+                        .find_active_session_with_id(self.scope_id.clone(), id)
                 })
             };
 
             if let Some(session) = from_last {
                 Ok(session)
             } else {
-                let candidates: Vec<SessionInfo> =
-                    SessionInfo::iter_active_sessions(self.scope_id.clone())?.collect();
+                let candidates: Vec<SessionInfo> = self
+                    .sessions
+                    .iter_active_sessions(self.scope_id.clone())
+                    .collect();
                 let session = resolve_unique_session(
                     candidates,
                     &self.scope_id,
@@ -552,10 +565,13 @@ impl McpHandler {
         let client = match reused {
             Some(client) => client,
             None => {
-                let client = Arc::new(DapperControlPlaneClient::new(
-                    session.control_plane_port,
-                    self.scope_id.clone(),
-                ));
+                let client = Arc::new(match session.control_plane_port {
+                    Some(port) => DapperControlPlaneClient::for_port(port),
+                    None => DapperControlPlaneClient::discover(
+                        self.sessions.clone(),
+                        self.scope_id.clone(),
+                    ),
+                });
                 let mut cache = self
                     .cached_client
                     .write()
@@ -928,34 +944,29 @@ Example:
         &self,
         _request: Parameters<EmptyParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        match SessionInfo::iter_active_sessions(self.scope_id.clone()) {
-            Ok(sessions) => {
-                let sessions: Vec<SessionInfo> = sessions.collect();
-                if sessions.is_empty() {
-                    Ok(CallToolResult::success(vec![Content::text(format!(
-                        "No active debug sessions found{}.",
-                        self.scope_id
-                            .as_ref()
-                            .map_or(String::new(), |s| format!(" in scope '{}'", s))
-                    ))]))
-                } else {
-                    let mut output = format!(
-                        "Found {} active session(s){}:\n\n",
-                        sessions.len(),
-                        self.scope_id
-                            .as_ref()
-                            .map_or(String::new(), |s| format!(" in scope '{}'", s))
-                    );
-                    for session in &sessions {
-                        output.push_str(&format!("{}\n", session));
-                    }
-                    Ok(CallToolResult::success(vec![Content::text(output)]))
-                }
+        let sessions: Vec<SessionInfo> = self
+            .sessions
+            .iter_active_sessions(self.scope_id.clone())
+            .collect();
+        if sessions.is_empty() {
+            Ok(CallToolResult::success(vec![Content::text(format!(
+                "No active debug sessions found{}.",
+                self.scope_id
+                    .as_ref()
+                    .map_or(String::new(), |s| format!(" in scope '{}'", s))
+            ))]))
+        } else {
+            let mut output = format!(
+                "Found {} active session(s){}:\n\n",
+                sessions.len(),
+                self.scope_id
+                    .as_ref()
+                    .map_or(String::new(), |s| format!(" in scope '{}'", s))
+            );
+            for session in &sessions {
+                output.push_str(&format!("{}\n", session));
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error listing sessions: {:#}",
-                e
-            ))])),
+            Ok(CallToolResult::success(vec![Content::text(output)]))
         }
     }
 
@@ -1788,9 +1799,22 @@ mod tests {
         assert!(!required.contains(&json!("logMessage")));
     }
 
+    /// A store at a unique empty directory, so tests can never see — let
+    /// alone mutate — real sessions on the developer's machine.
+    fn isolated_store() -> SessionStore {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        SessionStore::at(std::env::temp_dir().join(format!(
+            "dapper-mcp-test-sessions-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )))
+    }
+
     fn full_toolset_handler() -> McpHandler {
         let toolset = crate::toolsets::Toolset::from(crate::toolsets::BuiltinToolset::Full);
-        McpHandler::new(None, None, &toolset)
+        McpHandler::new(None, None, &toolset, isolated_store())
     }
 
     /// The cache-first fast path in `get_client` must return the cached client
@@ -1805,7 +1829,7 @@ mod tests {
 
         let handler = full_toolset_handler(); // control_port = None
         let sid = SessionId::from("fast-path-session");
-        let client = Arc::new(DapperControlPlaneClient::new(None, None));
+        let client = Arc::new(DapperControlPlaneClient::discover(isolated_store(), None));
 
         // A live cached session: hold a listener so the port probe reports the
         // port as occupied, and use the current pid (via generate) so the
@@ -1877,9 +1901,14 @@ mod tests {
 
         let toolset = crate::toolsets::Toolset::from(crate::toolsets::BuiltinToolset::Full);
         // Port 1: no dapper session listens here, so resolve-by-port fails.
-        let handler = McpHandler::new(Some(Port::try_new(1).unwrap()), None, &toolset);
+        let handler = McpHandler::new(
+            Some(Port::try_new(1).unwrap()),
+            None,
+            &toolset,
+            isolated_store(),
+        );
         let sid = SessionId::from("control-port-session");
-        let client = Arc::new(DapperControlPlaneClient::new(None, None));
+        let client = Arc::new(DapperControlPlaneClient::discover(isolated_store(), None));
 
         // Seed a *live* matching cached session; if the fast path were taken it
         // would return this client. The control_port gate must prevent that.
@@ -2069,7 +2098,7 @@ mod tests {
             crate::toolsets::BuiltinToolset::Raw,
         ] {
             let toolset = crate::toolsets::Toolset::from(*builtin);
-            let handler = McpHandler::new(None, None, &toolset);
+            let handler = McpHandler::new(None, None, &toolset, isolated_store());
             assert!(
                 handler
                     .tool_router

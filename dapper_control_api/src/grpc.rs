@@ -45,6 +45,7 @@ use dapper_session::Port;
 use dapper_session::ScopeId;
 use dapper_session::SessionId;
 use dapper_session::SessionInfo;
+use dapper_session::SessionStore;
 use futures::future::Future;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -536,31 +537,48 @@ pub fn resolve_unique_session(
     }
 }
 
+/// How the client locates the control plane: an exact port, or discovery of
+/// the unique active session from a store, re-resolved on each call.
+#[derive(Debug, Clone)]
+enum SessionTarget {
+    Port(Port),
+    Discover {
+        store: SessionStore,
+        scope_id: Option<ScopeId>,
+    },
+}
+
 pub struct DapperControlPlaneClient {
-    port: Option<Port>,
-    scope_id: Option<ScopeId>,
+    target: SessionTarget,
     /// Cached gRPC channel for connection reuse. Invalidated when port changes.
     cached_connection: Arc<Mutex<Option<CachedConnection>>>,
 }
 
 impl DapperControlPlaneClient {
-    pub fn new(port: Option<Port>, scope_id: Option<ScopeId>) -> Self {
+    /// A client for the control plane listening on a known port.
+    pub fn for_port(port: Port) -> Self {
+        Self::with_target(SessionTarget::Port(port))
+    }
+
+    /// A client that discovers the unique active session in `store`
+    /// (optionally narrowed by `scope_id`) and targets its control plane.
+    pub fn discover(store: SessionStore, scope_id: Option<ScopeId>) -> Self {
+        Self::with_target(SessionTarget::Discover { store, scope_id })
+    }
+
+    fn with_target(target: SessionTarget) -> Self {
         Self {
-            port,
-            scope_id,
+            target,
             cached_connection: Arc::new(Mutex::new(None)),
         }
     }
 
-    fn resolve_port(
-        port: &Option<Port>,
-        scope_id: &Option<ScopeId>,
-    ) -> anyhow::Result<(Port, Option<SessionId>)> {
-        match port {
-            Some(p) => Ok((*p, None)),
-            None => {
+    fn resolve_port(&self) -> anyhow::Result<(Port, Option<SessionId>)> {
+        match &self.target {
+            SessionTarget::Port(p) => Ok((*p, None)),
+            SessionTarget::Discover { store, scope_id } => {
                 let sessions: Vec<SessionInfo> =
-                    SessionInfo::iter_active_sessions(scope_id.clone())?.collect();
+                    store.iter_active_sessions(scope_id.clone()).collect();
                 let session = resolve_unique_session(sessions, scope_id, None)?;
                 let port = session
                     .control_plane_port
@@ -573,7 +591,7 @@ impl DapperControlPlaneClient {
     async fn get_client(
         &self,
     ) -> anyhow::Result<dapper_control_plane_client::DapperControlPlaneClient<Channel>> {
-        let (port, proxy_session_id) = Self::resolve_port(&self.port, &self.scope_id)?;
+        let (port, proxy_session_id) = self.resolve_port()?;
 
         // Reuse cached connection if port matches
         {
@@ -1105,7 +1123,7 @@ mod tests {
         // give the server task a chance to run
         tokio::task::yield_now().await;
 
-        let client = DapperControlPlaneClient::new(Some(control_plane_server.port), None);
+        let client = DapperControlPlaneClient::for_port(control_plane_server.port);
 
         client.stop().await?;
         assert!(stop_was_called.load(Ordering::Relaxed));

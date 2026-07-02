@@ -9,6 +9,7 @@ use dapper_session::RequestType;
 use dapper_session::ScopeId;
 use dapper_session::SessionId;
 use dapper_session::SessionInfo;
+use dapper_session::SessionStore;
 
 use super::breakpoint_state::BreakpointState;
 use super::exception_filter_state::ExceptionFilterState;
@@ -67,6 +68,7 @@ impl DebugSessionTrackerInner {
         &mut self,
         session_id: &SessionId,
         parent_session_id: Option<&SessionId>,
+        sessions: Option<&SessionStore>,
     ) {
         if self.session_file_written {
             return;
@@ -88,7 +90,11 @@ impl DebugSessionTrackerInner {
         }
 
         if let Some(ref session_info) = self.session_info {
-            match session_info.write_to_file() {
+            let Some(store) = sessions else {
+                tracing::warn!("Session store unavailable; session file not written");
+                return;
+            };
+            match store.save(session_info) {
                 Ok(path) => {
                     tracing::info!("Session file written to: {}", path.display());
                     self.session_file_written = true;

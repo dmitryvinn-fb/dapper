@@ -31,6 +31,7 @@ use dapper_session::RequestType;
 use dapper_session::ScopeId;
 use dapper_session::SessionId;
 use dapper_session::SessionInfo;
+use dapper_session::SessionStore;
 pub use execution_state::ExecutionState;
 use tracker_inner::DebugSessionTrackerInner;
 
@@ -50,6 +51,10 @@ pub struct DebugSessionTracker {
     parent_session_id: Option<SessionId>,
     /// Configuration — immutable after construction, readable without locking.
     config: DapperConfig,
+    /// Where session files are written and other sessions are discovered.
+    /// `None` when no sessions dir is available: session files are skipped
+    /// (with a warning) and other-session discovery is empty.
+    sessions: Option<SessionStore>,
     inner: Arc<Mutex<DebugSessionTrackerInner>>,
 }
 
@@ -60,7 +65,8 @@ impl DebugSessionTracker {
     ///
     /// # Arguments
     /// * `session_id` - Unique identifier for this debug session
-    pub fn new(session_id: SessionId) -> Self {
+    /// * `sessions` - Session store for session files, if one is available
+    pub fn new(session_id: SessionId, sessions: Option<SessionStore>) -> Self {
         let config = DapperConfig::load_or_default();
         let inner = Arc::new(Mutex::new(DebugSessionTrackerInner::new(
             &session_id,
@@ -70,6 +76,7 @@ impl DebugSessionTracker {
             session_id,
             parent_session_id: None,
             config,
+            sessions,
             inner,
         }
     }
@@ -221,10 +228,11 @@ impl DebugSessionTracker {
     ) {
         let session_id = &self.session_id;
         let parent_session_id = self.parent_session_id.as_ref();
+        let sessions = self.sessions.as_ref();
         self.with_inner((), "registering control plane", |inner| {
             inner.control_plane_port = control_plane_port;
             inner.scope_id = scope_id;
-            inner.try_finalize_session(session_id, parent_session_id);
+            inner.try_finalize_session(session_id, parent_session_id, sessions);
         });
     }
 
@@ -293,6 +301,7 @@ impl DebugSessionTracker {
     ) {
         let session_id = &self.session_id;
         let parent_session_id = self.parent_session_id.as_ref();
+        let sessions = self.sessions.as_ref();
         self.with_inner((), "tracking launch/attach request", |inner| {
             inner.debugger_args = debugger_args;
             inner.request_type = Some(request_type);
@@ -303,7 +312,7 @@ impl DebugSessionTracker {
                 request_type
             );
 
-            inner.try_finalize_session(session_id, parent_session_id);
+            inner.try_finalize_session(session_id, parent_session_id, sessions);
         });
     }
 
@@ -425,17 +434,18 @@ impl DebugSessionTracker {
         })?;
 
         // Filesystem I/O happens here, outside the lock.
-        let other_sessions = if ctx.show_sessions {
-            let scope_id = SessionInfo::find_active_session_with_id(None, &self.session_id)
-                .ok()
-                .flatten()
-                .and_then(|s| s.scope_id);
+        let other_sessions = match (&self.sessions, ctx.show_sessions) {
+            (Some(store), true) => {
+                let scope_id = store
+                    .find_active_session_with_id(None, &self.session_id)
+                    .and_then(|s| s.scope_id);
 
-            SessionInfo::iter_active_sessions(scope_id)
-                .map(|iter| iter.filter(|s| s.session_id != self.session_id).collect())
-                .unwrap_or_default()
-        } else {
-            vec![]
+                store
+                    .iter_active_sessions(scope_id)
+                    .filter(|s| s.session_id != self.session_id)
+                    .collect()
+            }
+            _ => vec![],
         };
 
         Some(dapper_control_api::ResponseContext {
@@ -528,9 +538,21 @@ mod tests {
 
     use super::*;
 
+    fn test_store() -> SessionStore {
+        SessionStore::at(dapper_session::get_user_temp_dir().join("tracker_test_sessions"))
+    }
+
+    fn test_tracker_with_id(session_id: SessionId) -> DebugSessionTracker {
+        DebugSessionTracker::new(session_id, Some(test_store()))
+    }
+
+    fn test_tracker() -> DebugSessionTracker {
+        test_tracker_with_id("test-session".into())
+    }
+
     #[test]
     fn test_parse_breakpoints_with_source_in_response() {
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
 
         let source_path = "/some/path/to/main.cpp";
         let request_seq = Seq(42);
@@ -613,7 +635,7 @@ mod tests {
 
     #[test]
     fn test_clear_breakpoints_with_empty_array() {
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
 
         let source_path = "/some/path/to/main.cpp";
 
@@ -706,7 +728,7 @@ mod tests {
                 .as_nanos()
         )
         .into();
-        let tracker = DebugSessionTracker::new(session_id);
+        let tracker = test_tracker_with_id(session_id);
 
         let event = Event {
             seq: 100.into(),
@@ -746,7 +768,7 @@ mod tests {
                 .as_nanos()
         )
         .into();
-        let tracker = DebugSessionTracker::new(session_id);
+        let tracker = test_tracker_with_id(session_id);
 
         // Send multiple output events
         for i in 1..=5 {
@@ -780,7 +802,7 @@ mod tests {
 
     #[test]
     fn test_track_typed_set_breakpoints_request_and_response() {
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
 
         let request_seq = Seq(50);
         let request = Request {
@@ -827,7 +849,7 @@ mod tests {
     fn test_track_typed_launch_request() {
         use dapper_dap_protocol::requests::LaunchRequestArguments;
 
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
 
         let request = Request {
             seq: Seq(1),
@@ -852,7 +874,7 @@ mod tests {
 
     #[test]
     fn test_track_typed_continue_and_stopped() {
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
 
         let initial_stop = Event {
             seq: 100.into(),
@@ -903,7 +925,7 @@ mod tests {
 
     #[test]
     fn test_track_breakpoints_without_line_in_response() {
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
         let source_path = "/some/path/to/main.php";
         let request_seq = Seq(42);
 
@@ -966,7 +988,7 @@ mod tests {
 
     #[test]
     fn test_track_breakpoints_partial_line_in_response() {
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
         let source_path = "/some/path/to/main.php";
         let request_seq = Seq(42);
 
@@ -1025,7 +1047,7 @@ mod tests {
 
     #[test]
     fn test_track_breakpoints_with_source_missing_line() {
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
         let source_path = "/some/path/to/main.php";
 
         let requested_specs = vec![
@@ -1073,7 +1095,7 @@ mod tests {
 
     #[test]
     fn test_track_breakpoint_changed_event() {
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
         let source_path = "/some/path/to/main.cpp";
         let request_seq = Seq(42);
 
@@ -1137,7 +1159,7 @@ mod tests {
 
     #[test]
     fn test_deferred_breakpoint_resolution() {
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
         let source_path = "/some/path/to/main.php";
         let request_seq = Seq(42);
 
@@ -1201,7 +1223,7 @@ mod tests {
 
     #[test]
     fn test_deferred_resolution_updates_context_lines() {
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
         let source_path = "/some/path/to/main.php";
         let request_seq = Seq(42);
 
@@ -1300,7 +1322,7 @@ mod tests {
 
     #[test]
     fn test_breakpoint_event_moves_source_path() {
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
         let original_path = "/some/path/to/main.php";
         let resolved_path = "/canonical/path/to/main.php";
         let request_seq = Seq(42);
@@ -1368,7 +1390,7 @@ mod tests {
 
     #[test]
     fn test_track_breakpoints_with_source_alias_fallback() {
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
         let original_path = "/home/user/main.py";
         let resolved_path = "/canonical/main.py";
 
@@ -1399,7 +1421,7 @@ mod tests {
     /// Drive a synthetic Initialize response through the tracker and return the
     /// `supports_step_back` value the tracker captured.
     fn capture_step_back_after_initialize(caps: Option<Capabilities>) -> Option<Option<bool>> {
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
         let response = Response {
             seq: 1.into(),
             request_seq: 1.into(),
@@ -1455,7 +1477,7 @@ mod tests {
 
     #[test]
     fn capabilities_none_when_initialize_never_received() {
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
         assert!(tracker.adapter_capabilities().is_none());
     }
 
@@ -1465,7 +1487,7 @@ mod tests {
         // successful Initialize responses. Lock that in so a future change to
         // the success-gating doesn't silently let a half-initialized session
         // pass the reverse-debugging gate downstream.
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
         let response = Response {
             seq: 1.into(),
             request_seq: 1.into(),
@@ -1513,7 +1535,7 @@ mod tests {
     fn test_track_set_exception_breakpoints_request_response() {
         // IDE-driven round-trip: request → success response → installed
         // matches the request entries, sorted by filter id.
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
         let request = make_set_exception_breakpoints_request(Seq(7), vec!["uncaught", "raised"]);
         tracker.track_message_from_client(&Message::Request(request), ClientType::Main);
 
@@ -1531,7 +1553,7 @@ mod tests {
         // entries via `track_message_from_client` because their responses
         // don't reach `track_message_to_client`. They use the explicit
         // `update_exception_filters` setter instead.
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
         let request = make_set_exception_breakpoints_request(Seq(7), vec!["uncaught"]);
         tracker.track_message_from_client(&Message::Request(request), ClientType::Secondary);
 
@@ -1547,7 +1569,7 @@ mod tests {
     fn test_explicit_update_exception_filters_replaces() {
         // Control-plane setter path: explicit replace bypasses the
         // pending-request bookkeeping and updates `installed` directly.
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
         tracker.update_exception_filters(vec![
             ExceptionFilterEntry {
                 filter: "uncaught".to_string(),
@@ -1568,7 +1590,7 @@ mod tests {
     fn test_failed_response_pops_pending_without_replacing() {
         // Pending entry recorded → failure response arrives → installed
         // unchanged, pending cleared.
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
         // Pre-seed installed with a value via the explicit setter so we
         // can verify it's *not* replaced by the failed response.
         tracker.update_exception_filters(vec![ExceptionFilterEntry {
@@ -1589,7 +1611,7 @@ mod tests {
 
     #[test]
     fn test_response_context_includes_exception_filters() {
-        let tracker = DebugSessionTracker::new("test-session".into());
+        let tracker = test_tracker();
         tracker.update_exception_filters(vec![ExceptionFilterEntry {
             filter: "uncaught".to_string(),
             condition: None,
@@ -1622,7 +1644,7 @@ mod tests {
             let info = tracker
                 .get_session_info()
                 .expect("session should be finalized");
-            let _ = info.delete_file();
+            let _ = test_store().delete(&info);
             info
         }
 
@@ -1632,7 +1654,7 @@ mod tests {
             .as_nanos();
 
         // Child proxy: the parent id threads all the way into the SessionInfo.
-        let child = DebugSessionTracker::new(format!("child-{unique}").into())
+        let child = test_tracker_with_id(format!("child-{unique}").into())
             .with_parent_session_id(Some("the-parent".into()));
         assert_eq!(
             finalize(&child).parent_session_id,
@@ -1641,7 +1663,7 @@ mod tests {
         );
 
         // Root proxy: no parent id is recorded.
-        let root = DebugSessionTracker::new(format!("root-{unique}").into());
+        let root = test_tracker_with_id(format!("root-{unique}").into());
         assert_eq!(
             finalize(&root).parent_session_id,
             None,

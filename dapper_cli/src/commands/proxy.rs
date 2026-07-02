@@ -24,6 +24,7 @@ use dapper_proxy_server::SessionInitializer;
 use dapper_session::Port;
 use dapper_session::ScopeId;
 use dapper_session::SessionId;
+use dapper_session::SessionStore;
 use dapper_session::config::DebugSessionConfig;
 use dapper_session::config::SpawnConfig;
 use dapper_session::config::StdioSpawnConfig;
@@ -207,6 +208,15 @@ impl Proxy {
         let control_port = Port::try_new(self.control_port);
         tracing::info!(self.control_port, "Starting dapper proxy");
         let dapper_config = DapperConfig::load_or_default();
+        let sessions = match SessionStore::default_location() {
+            Ok(store) => Some(store),
+            Err(e) => {
+                tracing::warn!(
+                    "Sessions directory unavailable ({e}); session file will not be written"
+                );
+                None
+            }
+        };
 
         // SAFETY-CRITICAL ORDERING: consume `--events-fd` here, BEFORE
         // `create_backend` spawns the debug adapter. `EventWriter::from_raw_fd`
@@ -233,6 +243,7 @@ impl Proxy {
         let proxy_server = ProxyServer::new(
             backend,
             dapper_config,
+            sessions.clone(),
             session_id.clone(),
             self.parent_session_id.clone(),
         );
@@ -402,8 +413,11 @@ impl Proxy {
         }
 
         // Clean up session file if it was created
-        if let Some(session) = cleanup_client.debug_session_tracker().get_session_info() {
-            if let Err(e) = session.delete_file() {
+        if let (Some(store), Some(session)) = (
+            &sessions,
+            cleanup_client.debug_session_tracker().get_session_info(),
+        ) {
+            if let Err(e) = store.delete(&session) {
                 tracing::warn!("{}", e);
             } else {
                 tracing::info!("Session file cleaned up successfully");

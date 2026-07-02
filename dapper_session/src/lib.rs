@@ -22,11 +22,6 @@ use std::process;
 use anyhow::Context;
 use chrono::DateTime;
 use chrono::Local;
-// `dirs` is only referenced by the non-test `get_sessions_dir`, so the unittest
-// target compiles `cfg(test)` code where it appears unused. Reference it in test
-// builds too so RUSTUNUSEDDEPS does not flag it as an unused dependency.
-#[cfg(test)]
-use dirs as _;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_with::serde_as;
@@ -162,86 +157,6 @@ impl SessionInfo {
         self
     }
 
-    pub fn write_to_file(&self) -> anyhow::Result<PathBuf> {
-        let file_path = self.get_file_path()?;
-
-        // Ensure the directory exists before writing
-        if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create session dir: {}", parent.display()))?;
-        }
-
-        // Write to a temporary file first, then atomically rename into place.
-        // This prevents concurrent readers (iter_sessions) from seeing an
-        // empty or partially-written file and deleting it.
-        let tmp_path = file_path.with_extension("json.tmp");
-        let file = File::create(&tmp_path)
-            .with_context(|| format!("Failed to create session file: {}", tmp_path.display()))?;
-
-        let mut writer = BufWriter::new(file);
-        let write_result =
-            serde_json::to_writer(&mut writer, self).context("Failed to serialize session info");
-        let flush_result =
-            write_result.and_then(|()| writer.flush().context("Failed to flush session file"));
-
-        if let Err(e) = flush_result {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(e);
-        }
-
-        if let Err(e) = fs::rename(&tmp_path, &file_path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(e).with_context(|| {
-                format!(
-                    "Failed to rename {} -> {}",
-                    tmp_path.display(),
-                    file_path.display()
-                )
-            });
-        }
-
-        Ok(file_path)
-    }
-
-    pub fn delete_file(&self) -> anyhow::Result<()> {
-        let file_path = self.get_file_path()?;
-
-        match fs::remove_file(&file_path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(anyhow::anyhow!("Failed to delete session file: {}", e)),
-        }
-    }
-
-    #[cfg(not(test))]
-    fn get_sessions_dir() -> anyhow::Result<PathBuf> {
-        if let Ok(env_dir) = env::var("DAPPER_SESSIONS_DIR") {
-            return Ok(PathBuf::from(env_dir));
-        }
-
-        let sessions_dir = dirs::data_dir()
-            .ok_or_else(|| anyhow::anyhow!("Failed to get data directory"))?
-            .join("dapper")
-            .join("sessions");
-        Ok(sessions_dir)
-    }
-
-    #[cfg(test)]
-    fn get_sessions_dir() -> anyhow::Result<PathBuf> {
-        Ok(get_user_temp_dir().join("test_sessions"))
-    }
-
-    fn get_file_path(&self) -> anyhow::Result<PathBuf> {
-        let sessions_dir = Self::get_sessions_dir()?;
-
-        let filename = format!(
-            "dapper_proxy_{}_{}_{}.json",
-            self.started_at, self.pid, self.session_id
-        );
-
-        Ok(sessions_dir.join(filename))
-    }
-
     pub fn is_process_alive(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -291,11 +206,100 @@ impl SessionInfo {
     pub fn is_active(&self) -> bool {
         self.is_process_alive() && self.is_port_reachable()
     }
+}
 
-    pub fn iter_sessions() -> anyhow::Result<impl Iterator<Item = SessionInfo>> {
-        let sessions_dir = Self::get_sessions_dir()?;
+/// A directory of session files.
+///
+/// Owns the location so callers — and tests — decide where sessions live
+/// instead of relying on process-global state.
+#[derive(Debug, Clone)]
+pub struct SessionStore {
+    dir: PathBuf,
+}
 
-        let mut paths: Vec<PathBuf> = fs::read_dir(&sessions_dir)
+impl SessionStore {
+    /// The standard per-user location: `DAPPER_SESSIONS_DIR` if set,
+    /// otherwise under the user data directory.
+    pub fn default_location() -> anyhow::Result<Self> {
+        if let Ok(env_dir) = env::var("DAPPER_SESSIONS_DIR") {
+            return Ok(Self::at(env_dir));
+        }
+
+        let dir = dirs::data_dir()
+            .ok_or_else(|| anyhow::anyhow!("Failed to get data directory"))?
+            .join("dapper")
+            .join("sessions");
+        Ok(Self::at(dir))
+    }
+
+    /// A store at an explicit directory (tests, embedders).
+    pub fn at(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+
+    fn file_path(&self, session: &SessionInfo) -> PathBuf {
+        let filename = format!(
+            "dapper_proxy_{}_{}_{}.json",
+            session.started_at, session.pid, session.session_id
+        );
+        self.dir.join(filename)
+    }
+
+    pub fn save(&self, session: &SessionInfo) -> anyhow::Result<PathBuf> {
+        let file_path = self.file_path(session);
+
+        // Ensure the directory exists before writing
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create session dir: {}", parent.display()))?;
+        }
+
+        // Write to a temporary file first, then atomically rename into place.
+        // This prevents concurrent readers (iter_sessions) from seeing an
+        // empty or partially-written file and deleting it.
+        let tmp_path = file_path.with_extension("json.tmp");
+        let file = File::create(&tmp_path)
+            .with_context(|| format!("Failed to create session file: {}", tmp_path.display()))?;
+
+        let mut writer = BufWriter::new(file);
+        let write_result =
+            serde_json::to_writer(&mut writer, session).context("Failed to serialize session info");
+        let flush_result =
+            write_result.and_then(|()| writer.flush().context("Failed to flush session file"));
+
+        if let Err(e) = flush_result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+
+        if let Err(e) = fs::rename(&tmp_path, &file_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e).with_context(|| {
+                format!(
+                    "Failed to rename {} -> {}",
+                    tmp_path.display(),
+                    file_path.display()
+                )
+            });
+        }
+
+        Ok(file_path)
+    }
+
+    pub fn delete(&self, session: &SessionInfo) -> anyhow::Result<()> {
+        let file_path = self.file_path(session);
+
+        match fs::remove_file(&file_path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("Failed to delete session file: {}", e)),
+        }
+    }
+
+    /// Iterate all parseable session files. Unparsable files are deleted as
+    /// they are encountered (they are debris from crashed sessions).
+    pub fn iter_sessions(&self) -> impl Iterator<Item = SessionInfo> + use<> {
+        let mut paths: Vec<PathBuf> = fs::read_dir(&self.dir)
             .map(|entries| {
                 entries
                     .filter_map(|entry| {
@@ -312,7 +316,7 @@ impl SessionInfo {
             .unwrap_or_else(|e| {
                 tracing::warn!(
                     "Failed to read sessions directory {}: {}. Returning empty sessions iterator.",
-                    sessions_dir.display(),
+                    self.dir.display(),
                     e
                 );
                 Vec::new()
@@ -320,7 +324,7 @@ impl SessionInfo {
 
         paths.sort();
 
-        let iter = paths.into_iter().filter_map(|path| {
+        paths.into_iter().filter_map(|path| {
             let file = match File::open(&path) {
                 Ok(file) => file,
                 Err(e) => {
@@ -344,15 +348,18 @@ impl SessionInfo {
                     None
                 }
             }
-        });
-
-        Ok(iter)
+        })
     }
 
+    /// Iterate the active sessions (optionally filtered by scope). Stale
+    /// session files — ones whose process or control port is gone — are
+    /// deleted as they are encountered.
     pub fn iter_active_sessions(
+        &self,
         scope_id: Option<ScopeId>,
-    ) -> anyhow::Result<impl Iterator<Item = SessionInfo>> {
-        Ok(Self::iter_sessions()?.filter_map(move |session| {
+    ) -> impl Iterator<Item = SessionInfo> + use<> {
+        let store = self.clone();
+        self.iter_sessions().filter_map(move |session| {
             if let Some(ref filter_scope) = scope_id
                 && session.scope_id.as_ref() != Some(filter_scope)
             {
@@ -360,7 +367,7 @@ impl SessionInfo {
             }
 
             if !session.is_active() {
-                if let Err(e) = session.delete_file() {
+                if let Err(e) = store.delete(&session) {
                     tracing::warn!(
                         "Failed to delete stale session file for pid {}: {}",
                         session.pid,
@@ -370,14 +377,16 @@ impl SessionInfo {
                 return None;
             }
             Some(session)
-        }))
+        })
     }
 
     pub fn find_active_session_with_id(
+        &self,
         scope_id: Option<ScopeId>,
         session_id: &SessionId,
-    ) -> anyhow::Result<Option<SessionInfo>> {
-        Ok(Self::iter_active_sessions(scope_id)?.find(|s| s.session_id == *session_id))
+    ) -> Option<SessionInfo> {
+        self.iter_active_sessions(scope_id)
+            .find(|s| s.session_id == *session_id)
     }
 }
 
@@ -452,6 +461,10 @@ impl fmt::Display for SessionInfo {
 mod tests {
     use super::*;
 
+    fn test_store() -> SessionStore {
+        SessionStore::at(get_user_temp_dir().join("test_sessions"))
+    }
+
     #[test]
     fn test_session_info_creation() {
         let session_info = SessionInfo::generate(
@@ -482,11 +495,12 @@ mod tests {
             None,
         );
 
-        let file_path = session_info.write_to_file().unwrap();
+        let store = test_store();
+        let file_path = store.save(&session_info).unwrap();
         assert!(file_path.exists());
-        session_info.delete_file().unwrap();
+        store.delete(&session_info).unwrap();
         assert!(!file_path.exists());
-        session_info.delete_file().unwrap();
+        store.delete(&session_info).unwrap();
     }
 
     #[test]
@@ -520,6 +534,7 @@ mod tests {
 
     #[test]
     fn test_iter_sessions() {
+        let store = test_store();
         let test_scope: ScopeId = format!("test-scope-{}", uuid::Uuid::new_v4()).into();
 
         let session1 = SessionInfo::generate(
@@ -529,7 +544,7 @@ mod tests {
             Some(RequestType::Launch),
             None,
         );
-        session1.write_to_file().unwrap();
+        store.save(&session1).unwrap();
 
         let session2 = SessionInfo::generate(
             "session2-id".into(),
@@ -538,10 +553,10 @@ mod tests {
             Some(RequestType::Attach),
             None,
         );
-        session2.write_to_file().unwrap();
+        store.save(&session2).unwrap();
 
-        let sessions: Vec<SessionInfo> = SessionInfo::iter_sessions()
-            .unwrap()
+        let sessions: Vec<SessionInfo> = store
+            .iter_sessions()
             .filter(|s| s.scope_id.as_ref() == Some(&test_scope))
             .collect();
 
@@ -549,8 +564,35 @@ mod tests {
         assert_eq!(sessions[0].control_plane_port.unwrap().get(), 11111);
         assert_eq!(sessions[1].control_plane_port.unwrap().get(), 22222);
 
-        session1.delete_file().unwrap();
-        session2.delete_file().unwrap();
+        store.delete(&session1).unwrap();
+        store.delete(&session2).unwrap();
+    }
+
+    /// Stores at different directories are fully isolated: a session saved
+    /// in one store is invisible to another. This is the property that lets
+    /// dependent crates' tests avoid touching the real per-user sessions dir.
+    #[test]
+    fn test_stores_are_isolated_by_directory() {
+        let store_a = SessionStore::at(get_user_temp_dir().join("isolated_sessions_a"));
+        let store_b = SessionStore::at(get_user_temp_dir().join("isolated_sessions_b"));
+
+        let session = SessionInfo::generate(
+            "isolated-session-id".into(),
+            Port::try_new(12345),
+            None,
+            Some(RequestType::Launch),
+            None,
+        );
+        store_a.save(&session).unwrap();
+
+        assert!(
+            store_b
+                .iter_sessions()
+                .all(|s| s.session_id != session.session_id),
+            "session saved in store A must not be visible in store B"
+        );
+
+        store_a.delete(&session).unwrap();
     }
 
     #[test]

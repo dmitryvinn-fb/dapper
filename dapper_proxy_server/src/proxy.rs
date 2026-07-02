@@ -15,6 +15,7 @@ use dapper_dap_protocol::protocol as dap;
 use dapper_dap_protocol::protocol::Message;
 use dapper_dap_protocol::requests::RequestCommand;
 use dapper_session::SessionId;
+use dapper_session::SessionStore;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -185,6 +186,7 @@ impl ProxyServer {
     pub fn new(
         backend: Backend<Message>,
         config: DapperConfig,
+        sessions: Option<SessionStore>,
         session_id: SessionId,
         parent_session_id: Option<SessionId>,
     ) -> Self {
@@ -193,8 +195,8 @@ impl ProxyServer {
 
         let (event_channel, event_channel_rx) = EventChannel::new_pair();
 
-        let debug_session_tracker =
-            DebugSessionTracker::new(session_id).with_parent_session_id(parent_session_id);
+        let debug_session_tracker = DebugSessionTracker::new(session_id, sessions)
+            .with_parent_session_id(parent_session_id);
 
         Self {
             backend,
@@ -583,8 +585,16 @@ mod tests {
                 handle: None,
             };
             let config = DapperConfig::default();
-            let proxy_server =
-                ProxyServer::new(backend, config, SessionId::from("test-session"), None);
+            let sessions = dapper_session::SessionStore::at(
+                dapper_session::get_user_temp_dir().join("proxy_test_sessions"),
+            );
+            let proxy_server = ProxyServer::new(
+                backend,
+                config,
+                Some(sessions),
+                SessionId::from("test-session"),
+                None,
+            );
 
             let proxy_client = proxy_server.create_client(ClientId::new("test-control"));
 

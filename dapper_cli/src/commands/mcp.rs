@@ -10,6 +10,7 @@ use dapper_mcp_server::DebugTool;
 use dapper_mcp_server::Toolset;
 use dapper_session::Port;
 use dapper_session::ScopeId;
+use dapper_session::SessionStore;
 use strum::VariantNames;
 
 fn debug_tool_parser() -> impl clap::builder::TypedValueParser {
@@ -51,7 +52,8 @@ impl Mcp {
             self.toolset.into()
         };
 
-        dapper_mcp_server::serve(self.control_port, self.scope_id, toolset).await
+        let sessions = SessionStore::default_location()?;
+        dapper_mcp_server::serve(self.control_port, self.scope_id, toolset, sessions).await
     }
 }
 

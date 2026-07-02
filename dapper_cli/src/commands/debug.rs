@@ -24,6 +24,7 @@ use dapper_dap_protocol::data_types::VariablesReference;
 use dapper_session::Port;
 use dapper_session::ScopeId;
 use dapper_session::SessionInfo;
+use dapper_session::SessionStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum StepType {
@@ -277,7 +278,13 @@ pub struct Debug {
 
 impl Debug {
     pub async fn run(self, config: DapperConfig) -> anyhow::Result<()> {
-        let client = DapperControlPlaneClient::new(self.control_port, self.scope_id.clone());
+        let client = match self.control_port {
+            Some(port) => DapperControlPlaneClient::for_port(port),
+            None => DapperControlPlaneClient::discover(
+                SessionStore::default_location()?,
+                self.scope_id.clone(),
+            ),
+        };
 
         match self.command {
             DebugCommands::Status {} => {
@@ -289,15 +296,16 @@ impl Debug {
                 safe_println(format_args!("{}", render(&result, &config)?));
             }
             DebugCommands::Config {} => {
+                let sessions = SessionStore::default_location()?;
                 let session = if let Some(port) = self.control_port {
-                    SessionInfo::iter_active_sessions(self.scope_id.clone())
-                        .context("Error listing sessions")?
+                    sessions
+                        .iter_active_sessions(self.scope_id.clone())
                         .find(|s| s.control_plane_port.map(|p| p.get()) == Some(port.get()))
                         .ok_or_else(|| anyhow::anyhow!("no session found on port {}", port.get()))?
                 } else {
                     dapper_control_api::resolve_unique_session(
-                        SessionInfo::iter_active_sessions(self.scope_id.clone())
-                            .context("Error listing sessions")?
+                        sessions
+                            .iter_active_sessions(self.scope_id.clone())
                             .collect(),
                         &self.scope_id,
                         None,
@@ -438,10 +446,9 @@ impl Debug {
                 safe_println(format_args!("{}", render(&result, &config)?));
             }
             DebugCommands::Sessions {} => {
-                let sessions: Vec<SessionInfo> =
-                    SessionInfo::iter_active_sessions(self.scope_id.clone())
-                        .context("Error listing sessions")?
-                        .collect();
+                let sessions: Vec<SessionInfo> = SessionStore::default_location()?
+                    .iter_active_sessions(self.scope_id.clone())
+                    .collect();
 
                 let sessions_result = SessionsResult {
                     sessions,

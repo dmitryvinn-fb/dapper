@@ -6,6 +6,7 @@
 use anyhow::Context;
 use dapper_session::Port;
 use dapper_session::ScopeId;
+use dapper_session::SessionStore;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 
@@ -17,6 +18,7 @@ pub async fn serve(
     control_port: Option<Port>,
     scope_id: Option<ScopeId>,
     toolset: Toolset,
+    sessions: SessionStore,
 ) -> anyhow::Result<()> {
     tracing::info!(
         "Starting MCP server with toolset '{}' ({} tool(s))",
@@ -24,7 +26,7 @@ pub async fn serve(
         toolset.tools.len()
     );
 
-    let service = McpHandler::new(control_port, scope_id, &toolset)
+    let service = McpHandler::new(control_port, scope_id, &toolset, sessions)
         .serve(stdio())
         .await
         .context("Failed to start serving")?;
