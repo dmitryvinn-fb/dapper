@@ -798,65 +798,66 @@ impl ProxyClient {
         wait_for_event: bool,
         timeout_seconds: u64,
     ) -> anyhow::Result<dapper_control_api::RawDapResult> {
-        let request_timeout = std::time::Duration::from_secs(if timeout_seconds > 0 {
+        let timeout = std::time::Duration::from_secs(if timeout_seconds > 0 {
             timeout_seconds
         } else {
             Self::DEFAULT_REQUEST_TIMEOUT_SECS
         });
 
-        let inner = async {
-            let request = dap::Request::new(RequestCommand::Unknown(UnknownCommand {
-                command: command.to_owned(),
-                arguments,
-                extra: Default::default(),
-            }));
+        let request = dap::Request::new(RequestCommand::Unknown(UnknownCommand {
+            command: command.to_owned(),
+            arguments,
+            extra: Default::default(),
+        }));
 
+        let round_trip = async {
             let ListenerPayload { seq, mut messages } = self.send_message(request.into()).await?;
             let response = helpers::wait_for_response(seq, &mut messages).await?;
             response.check_success()?;
-
-            let body = response.body;
-
-            if wait_for_event {
-                let timeout = Some(std::time::Duration::from_secs(timeout_seconds));
-                let event = match helpers::wait_for_events_timeout(
-                    |e| {
-                        matches!(
-                            e,
-                            EventKind::Stopped(_) | EventKind::Exited(_) | EventKind::Terminated(_)
-                        )
-                    },
-                    &mut messages,
-                    timeout,
-                )
-                .await
-                {
-                    Ok(event) => Some(WaitedEvent::Received(event.event)),
-                    Err(_) => Some(WaitedEvent::TimedOut { timeout_seconds }),
-                };
-
-                return Ok(RawDapResult {
-                    body,
-                    event,
-                    extra: Default::default(),
-                });
-            }
-
-            Ok(RawDapResult {
-                body,
-                event: None,
-                extra: Default::default(),
-            })
+            anyhow::Ok((response.body, messages))
         };
+        let (body, mut messages) =
+            tokio::time::timeout(timeout, round_trip)
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "DAP request '{}' timed out after {}s",
+                        command,
+                        timeout.as_secs()
+                    )
+                })??;
 
-        match tokio::time::timeout(request_timeout, inner).await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!(
-                "DAP request '{}' timed out after {}s",
-                command,
-                request_timeout.as_secs()
-            )),
+        if wait_for_event {
+            let event = match helpers::wait_for_events_timeout(
+                |e| {
+                    matches!(
+                        e,
+                        EventKind::Stopped(_) | EventKind::Exited(_) | EventKind::Terminated(_)
+                    )
+                },
+                &mut messages,
+                Some(timeout),
+            )
+            .await
+            {
+                Ok(event) => Some(WaitedEvent::Received(event.event)),
+                Err(_) => Some(WaitedEvent::TimedOut {
+                    timeout_seconds: timeout.as_secs(),
+                }),
+            };
+
+            return Ok(RawDapResult {
+                body,
+                event,
+                extra: Default::default(),
+            });
         }
+
+        Ok(RawDapResult {
+            body,
+            event: None,
+            extra: Default::default(),
+        })
     }
 
     pub fn send_dapper_event(&self, event: DapperEvent) -> anyhow::Result<()> {
