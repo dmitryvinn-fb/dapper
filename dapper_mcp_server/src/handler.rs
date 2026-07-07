@@ -621,7 +621,7 @@ impl McpHandler {
             Ok(result) => {
                 let config = DapperConfig {
                     context: dapper_config::ContextConfig::all_enabled(),
-                    ..Default::default()
+                    ..self.config.clone()
                 };
                 Ok(CallToolResult::success(vec![Content::text(
                     render_plaintext(&result, &config),
