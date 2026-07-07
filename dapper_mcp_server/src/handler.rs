@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use base64::Engine as _;
 use dapper_config::DapperConfig;
+use dapper_control_api::ControlPlaneResult;
 use dapper_control_api::DapperControlPlane;
 use dapper_control_api::DapperControlPlaneClient;
 use dapper_control_api::NavigationType;
@@ -91,6 +92,16 @@ pub struct McpHandler {
     /// that when the caller omits `session_id` we fall back to *their* session
     /// rather than an arbitrary active session.
     last_session_id: Arc<Mutex<Option<SessionId>>>,
+}
+
+/// Shorthand for a successful text tool result.
+fn ok_text(text: impl Into<String>) -> CallToolResult {
+    CallToolResult::success(vec![Content::text(text.into())])
+}
+
+/// Shorthand for a failed text tool result.
+fn err_text(text: impl Into<String>) -> CallToolResult {
+    CallToolResult::error(vec![Content::text(text.into())])
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -454,6 +465,13 @@ impl McpHandler {
         *self.last_session() = Some(session_id.clone());
     }
 
+    /// " in scope '<id>'" when a scope filter is active, empty otherwise.
+    fn scope_suffix(&self) -> String {
+        self.scope_id
+            .as_ref()
+            .map_or(String::new(), |s| format!(" in scope '{}'", s))
+    }
+
     /// Resolve the target session from an optional explicit session ID.
     fn resolve_session(&self, session_id: Option<&SessionId>) -> anyhow::Result<SessionInfo> {
         if let Some(explicit_port) = self.control_port {
@@ -469,9 +487,7 @@ impl McpHandler {
                     anyhow::anyhow!(
                         "Session '{}' not found or not active{}.",
                         id,
-                        self.scope_id
-                            .as_ref()
-                            .map_or(String::new(), |s| format!(" in scope '{}'", s))
+                        self.scope_suffix()
                     )
                 })?;
             self.set_last_session_id(id);
@@ -600,11 +616,26 @@ impl McpHandler {
         &self,
         session_id: Option<&SessionId>,
     ) -> Result<Arc<DapperControlPlaneClient>, CallToolResult> {
-        self.get_client(session_id).map_err(|e| {
-            CallToolResult::error(vec![Content::text(format!(
-                "Error connecting to session: {:#}",
-                e
-            ))])
+        self.get_client(session_id)
+            .map_err(|e| err_text(format!("Error connecting to session: {:#}", e)))
+    }
+
+    /// The shared skeleton of every plaintext-rendering tool: resolve the
+    /// target client, run `f` against it, render success with the handler's
+    /// config, and prefix errors with `err_ctx`.
+    async fn run_rendered<T: std::fmt::Display>(
+        &self,
+        session_id: Option<&SessionId>,
+        err_ctx: &str,
+        f: impl AsyncFnOnce(Arc<DapperControlPlaneClient>) -> anyhow::Result<ControlPlaneResult<T>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let client = match self.get_client_or_error(session_id) {
+            Ok(c) => c,
+            Err(e) => return Ok(e),
+        };
+        Ok(match f(client).await {
+            Ok(result) => ok_text(render_plaintext(&result, &self.config)),
+            Err(e) => err_text(format!("{err_ctx}: {e:#}")),
         })
     }
 
@@ -615,25 +646,21 @@ impl McpHandler {
         &self,
         request: Parameters<SessionTargeted<EmptyParams>>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = match self.get_client_or_error(request.0.session_id.as_ref()) {
+        let Parameters(SessionTargeted { session_id, .. }) = request;
+        let client = match self.get_client_or_error(session_id.as_ref()) {
             Ok(c) => c,
             Err(e) => return Ok(e),
         };
-        match client.status().await {
+        Ok(match client.status().await {
             Ok(result) => {
                 let config = DapperConfig {
                     context: dapper_config::ContextConfig::all_enabled(),
                     ..self.config.clone()
                 };
-                Ok(CallToolResult::success(vec![Content::text(
-                    render_plaintext(&result, &config),
-                )]))
+                ok_text(render_plaintext(&result, &config))
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error getting status: {:#}",
-                e
-            ))])),
-        }
+            Err(e) => err_text(format!("Error getting status: {:#}", e)),
+        })
     }
 
     #[tool(
@@ -643,19 +670,11 @@ impl McpHandler {
         &self,
         request: Parameters<SessionTargeted<EmptyParams>>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = match self.get_client_or_error(request.0.session_id.as_ref()) {
-            Ok(c) => c,
-            Err(e) => return Ok(e),
-        };
-        match client.threads().await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                render_plaintext(&result, &self.config),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error getting threads: {:#}",
-                e
-            ))])),
-        }
+        let Parameters(SessionTargeted { session_id, .. }) = request;
+        self.run_rendered(session_id.as_ref(), "Error getting threads", async |c| {
+            c.threads().await
+        })
+        .await
     }
 
     #[tool(
@@ -665,27 +684,21 @@ impl McpHandler {
         &self,
         request: Parameters<SessionTargeted<NavigateRequest>>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = match self.get_client_or_error(request.0.session_id.as_ref()) {
-            Ok(c) => c,
-            Err(e) => return Ok(e),
-        };
-        let result = client
-            .navigate(
-                request.0.inner.navigation_type,
-                request.0.inner.thread_id,
-                request.0.inner.single_thread,
-            )
-            .await;
-
-        match result {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                render_plaintext(&result, &self.config),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error executing navigate {} command: {:#}",
-                request.0.inner.navigation_type, e
-            ))])),
-        }
+        let Parameters(SessionTargeted {
+            session_id,
+            inner:
+                NavigateRequest {
+                    thread_id,
+                    navigation_type,
+                    single_thread,
+                },
+        }) = request;
+        self.run_rendered(
+            session_id.as_ref(),
+            &format!("Error executing navigate {} command", navigation_type),
+            async |c| c.navigate(navigation_type, thread_id, single_thread).await,
+        )
+        .await
     }
 
     #[tool(
@@ -695,26 +708,21 @@ impl McpHandler {
         &self,
         request: Parameters<SessionTargeted<StackTraceRequest>>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = match self.get_client_or_error(request.0.session_id.as_ref()) {
-            Ok(c) => c,
-            Err(e) => return Ok(e),
-        };
-        match client
-            .stack_trace(
-                request.0.inner.thread_id,
-                request.0.inner.start_frame,
-                request.0.inner.levels,
-            )
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                render_plaintext(&result, &self.config),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error getting stack trace: {:#}",
-                e
-            ))])),
-        }
+        let Parameters(SessionTargeted {
+            session_id,
+            inner:
+                StackTraceRequest {
+                    thread_id,
+                    start_frame,
+                    levels,
+                },
+        }) = request;
+        self.run_rendered(
+            session_id.as_ref(),
+            "Error getting stack trace",
+            async |c| c.stack_trace(thread_id, start_frame, levels).await,
+        )
+        .await
     }
 
     #[tool(
@@ -724,19 +732,14 @@ impl McpHandler {
         &self,
         request: Parameters<SessionTargeted<FrameIdRequest>>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = match self.get_client_or_error(request.0.session_id.as_ref()) {
-            Ok(c) => c,
-            Err(e) => return Ok(e),
-        };
-        match client.scopes(request.0.inner.frame_id).await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                render_plaintext(&result, &self.config),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error getting scopes: {:#}",
-                e
-            ))])),
-        }
+        let Parameters(SessionTargeted {
+            session_id,
+            inner: FrameIdRequest { frame_id },
+        }) = request;
+        self.run_rendered(session_id.as_ref(), "Error getting scopes", async |c| {
+            c.scopes(frame_id).await
+        })
+        .await
     }
 
     #[tool(
@@ -746,19 +749,16 @@ impl McpHandler {
         &self,
         request: Parameters<SessionTargeted<VariablesReferenceRequest>>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = match self.get_client_or_error(request.0.session_id.as_ref()) {
-            Ok(c) => c,
-            Err(e) => return Ok(e),
-        };
-        match client.variables(request.0.inner.variables_reference).await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                render_plaintext(&result, &self.config),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error getting variables: {:#}",
-                e
-            ))])),
-        }
+        let Parameters(SessionTargeted {
+            session_id,
+            inner: VariablesReferenceRequest {
+                variables_reference,
+            },
+        }) = request;
+        self.run_rendered(session_id.as_ref(), "Error getting variables", async |c| {
+            c.variables(variables_reference).await
+        })
+        .await
     }
 
     #[tool(
@@ -768,26 +768,19 @@ impl McpHandler {
         &self,
         request: Parameters<SessionTargeted<SetVariableRequest>>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = match self.get_client_or_error(request.0.session_id.as_ref()) {
-            Ok(c) => c,
-            Err(e) => return Ok(e),
-        };
-        match client
-            .set_variable(
-                request.0.inner.variables_reference,
-                request.0.inner.name.as_str(),
-                request.0.inner.value.as_str(),
-            )
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                render_plaintext(&result, &self.config),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error setting variable: {:#}",
-                e
-            ))])),
-        }
+        let Parameters(SessionTargeted {
+            session_id,
+            inner:
+                SetVariableRequest {
+                    variables_reference,
+                    name,
+                    value,
+                },
+        }) = request;
+        self.run_rendered(session_id.as_ref(), "Error setting variable", async |c| {
+            c.set_variable(variables_reference, &name, &value).await
+        })
+        .await
     }
 
     #[tool(
@@ -808,33 +801,24 @@ Example:
         &self,
         request: Parameters<SessionTargeted<SetBreakpointsRequest>>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = match self.get_client_or_error(request.0.session_id.as_ref()) {
-            Ok(c) => c,
-            Err(e) => return Ok(e),
-        };
-        let breakpoint_specs: Vec<SourceBreakpoint> = request
-            .0
-            .inner
-            .breakpoints
+        let Parameters(SessionTargeted {
+            session_id,
+            inner:
+                SetBreakpointsRequest {
+                    source_path,
+                    breakpoints,
+                    clear_existing,
+                },
+        }) = request;
+        let breakpoint_specs: Vec<SourceBreakpoint> = breakpoints
             .into_iter()
             .map(SourceBreakpoint::from)
             .collect();
-        match client
-            .set_breakpoints(
-                &request.0.inner.source_path,
-                request.0.inner.clear_existing,
-                &breakpoint_specs,
-            )
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                render_plaintext(&result, &self.config),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error setting breakpoint: {:#}",
-                e
-            ))])),
-        }
+        self.run_rendered(session_id.as_ref(), "Error setting breakpoint", async |c| {
+            c.set_breakpoints(&source_path, clear_existing, &breakpoint_specs)
+                .await
+        })
+        .await
     }
 
     #[tool(
@@ -857,10 +841,14 @@ Example:
         &self,
         request: Parameters<SessionTargeted<SetExceptionBreakpointsRequest>>,
     ) -> Result<CallToolResult, ErrorData> {
-        let SetExceptionBreakpointsRequest {
-            filters,
-            clear_existing,
-        } = request.0.inner;
+        let Parameters(SessionTargeted {
+            session_id,
+            inner:
+                SetExceptionBreakpointsRequest {
+                    filters,
+                    clear_existing,
+                },
+        }) = request;
 
         // Strict empty-input validation (per design): empty + !clear is a
         // no-op, which is almost certainly a user/agent mistake. The
@@ -868,33 +856,22 @@ Example:
         // forgiving and silently no-ops; we reject here at the
         // user-facing surface so the LLM gets clear feedback.
         //
-        // Intentionally validates *before* `get_client_or_error` so the
+        // Intentionally validates *before* resolving the client so the
         // error message is the actionable one (about the missing filter)
         // rather than a confusing "no active session" — the caller can
         // fix the request shape regardless of session state.
         if filters.is_empty() && !clear_existing {
-            return Ok(CallToolResult::error(vec![Content::text(
-                "specify at least one filter or set clear_existing: true to disable all exception breakpoints"
-                    .to_string(),
-            )]));
+            return Ok(err_text(
+                "specify at least one filter or set clear_existing: true to disable all exception breakpoints",
+            ));
         }
 
-        let client = match self.get_client_or_error(request.0.session_id.as_ref()) {
-            Ok(c) => c,
-            Err(e) => return Ok(e),
-        };
-        match client
-            .set_exception_breakpoints(&filters, clear_existing)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                render_plaintext(&result, &self.config),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error setting exception breakpoints: {:#}",
-                e
-            ))])),
-        }
+        self.run_rendered(
+            session_id.as_ref(),
+            "Error setting exception breakpoints",
+            async |c| c.set_exception_breakpoints(&filters, clear_existing).await,
+        )
+        .await
     }
 
     #[tool(
@@ -904,20 +881,22 @@ Example:
         &self,
         request: Parameters<SessionTargeted<EvaluateRequest>>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = match self.get_client_or_error(request.0.session_id.as_ref()) {
+        let Parameters(SessionTargeted {
+            session_id,
+            inner:
+                EvaluateRequest {
+                    expression,
+                    frame_id,
+                },
+        }) = request;
+        let client = match self.get_client_or_error(session_id.as_ref()) {
             Ok(c) => c,
             Err(e) => return Ok(e),
         };
-        match client
-            .eval_repl(&request.0.inner.expression, request.0.inner.frame_id)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(result)])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error evaluating expression: {:#}",
-                e
-            ))])),
-        }
+        Ok(match client.eval_repl(&expression, frame_id).await {
+            Ok(result) => ok_text(result),
+            Err(e) => err_text(format!("Error evaluating expression: {:#}", e)),
+        })
     }
 
     #[tool(
@@ -927,16 +906,15 @@ Example:
         &self,
         request: Parameters<SessionTargeted<EmptyParams>>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = match self.get_client_or_error(request.0.session_id.as_ref()) {
+        let Parameters(SessionTargeted { session_id, .. }) = request;
+        let client = match self.get_client_or_error(session_id.as_ref()) {
             Ok(c) => c,
             Err(e) => return Ok(e),
         };
         // When stopping, the server shuts down immediately. Connection errors
         // are expected.
         let _ = client.stop().await;
-        Ok(CallToolResult::success(vec![Content::text(
-            "Dapper proxy server stopped.",
-        )]))
+        Ok(ok_text("Dapper proxy server stopped."))
     }
 
     #[tool(
@@ -951,24 +929,20 @@ Example:
             .iter_active_sessions(self.scope_id.clone())
             .collect();
         if sessions.is_empty() {
-            Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(ok_text(format!(
                 "No active debug sessions found{}.",
-                self.scope_id
-                    .as_ref()
-                    .map_or(String::new(), |s| format!(" in scope '{}'", s))
-            ))]))
+                self.scope_suffix()
+            )))
         } else {
             let mut output = format!(
                 "Found {} active session(s){}:\n\n",
                 sessions.len(),
-                self.scope_id
-                    .as_ref()
-                    .map_or(String::new(), |s| format!(" in scope '{}'", s))
+                self.scope_suffix()
             );
             for session in &sessions {
-                output.push_str(&format!("{}\n", session));
+                let _ = writeln!(output, "{}", session);
             }
-            Ok(CallToolResult::success(vec![Content::text(output)]))
+            Ok(ok_text(output))
         }
     }
 
@@ -979,21 +953,19 @@ Example:
         &self,
         request: Parameters<SessionTargeted<EmptyParams>>,
     ) -> Result<CallToolResult, ErrorData> {
-        match self.resolve_session(request.0.session_id.as_ref()) {
+        let Parameters(SessionTargeted { session_id, .. }) = request;
+        Ok(match self.resolve_session(session_id.as_ref()) {
             Ok(session) => {
                 let output = serde_json::json!({
                     "debugger_args": session.debugger_args,
                     "dapper_config": self.config,
                 });
-                Ok(CallToolResult::success(vec![Content::text(
+                ok_text(
                     serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
-                )]))
+                )
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error resolving session: {:#}",
-                e
-            ))])),
-        }
+            Err(e) => err_text(format!("Error resolving session: {:#}", e)),
+        })
     }
 
     #[tool(
@@ -1003,26 +975,24 @@ Example:
         &self,
         request: Parameters<SessionTargeted<EmptyParams>>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = match self.get_client_or_error(request.0.session_id.as_ref()) {
+        let Parameters(SessionTargeted { session_id, .. }) = request;
+        let client = match self.get_client_or_error(session_id.as_ref()) {
             Ok(c) => c,
             Err(e) => return Ok(e),
         };
-        match client.capabilities().await {
+        Ok(match client.capabilities().await {
             Ok(Some(json)) => {
                 let output = match serde_json::from_str::<serde_json::Value>(&json) {
                     Ok(value) => format_capabilities(&value),
                     Err(_) => json,
                 };
-                Ok(CallToolResult::success(vec![Content::text(output)]))
+                ok_text(output)
             }
-            Ok(None) => Ok(CallToolResult::success(vec![Content::text(
+            Ok(None) => ok_text(
                 "Adapter capabilities not yet available (initialize response not received).",
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error querying capabilities: {:#}",
-                e
-            ))])),
-        }
+            ),
+            Err(e) => err_text(format!("Error querying capabilities: {:#}", e)),
+        })
     }
 
     #[tool(
@@ -1088,38 +1058,42 @@ Response is JSON from the debug adapter."#
         &self,
         request: Parameters<SessionTargeted<RawDapRequestParams>>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = match self.get_client_or_error(request.0.session_id.as_ref()) {
+        let Parameters(SessionTargeted {
+            session_id,
+            inner:
+                RawDapRequestParams {
+                    command,
+                    arguments,
+                    wait_for_event,
+                    timeout_seconds,
+                },
+        }) = request;
+        let client = match self.get_client_or_error(session_id.as_ref()) {
             Ok(c) => c,
             Err(e) => return Ok(e),
         };
 
-        let arguments = match &request.0.inner.arguments {
+        // Tolerate stringified-JSON arguments (LLM clients sometimes
+        // double-encode); anything unparsable passes through verbatim.
+        let arguments = match arguments {
             Some(serde_json::Value::String(s)) => {
-                match serde_json::from_str::<serde_json::Value>(s) {
+                match serde_json::from_str::<serde_json::Value>(&s) {
                     Ok(parsed) => Some(parsed),
-                    Err(_) => request.0.inner.arguments.clone(),
+                    Err(_) => Some(serde_json::Value::String(s)),
                 }
             }
-            other => other.clone(),
+            other => other,
         };
 
-        match client
-            .send_dap_request(
-                &request.0.inner.command,
-                arguments,
-                request.0.inner.wait_for_event,
-                request.0.inner.timeout_seconds,
-            )
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                result.render(),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "DAP request '{}' failed: {:#}",
-                request.0.inner.command, e
-            ))])),
-        }
+        Ok(
+            match client
+                .send_dap_request(&command, arguments, wait_for_event, timeout_seconds)
+                .await
+            {
+                Ok(result) => ok_text(result.render()),
+                Err(e) => err_text(format!("DAP request '{}' failed: {:#}", command, e)),
+            },
+        )
     }
 
     #[tool(
@@ -1129,57 +1103,56 @@ Response is JSON from the debug adapter."#
         &self,
         request: Parameters<SessionTargeted<ReadMemoryRequest>>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = match self.get_client_or_error(request.0.session_id.as_ref()) {
+        let Parameters(SessionTargeted {
+            session_id,
+            inner:
+                ReadMemoryRequest {
+                    memory_reference,
+                    count,
+                    offset,
+                },
+        }) = request;
+        let client = match self.get_client_or_error(session_id.as_ref()) {
             Ok(c) => c,
             Err(e) => return Ok(e),
         };
 
-        let count = request.0.inner.count;
         if count <= 0 {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "count must be > 0, got {}",
-                count
-            ))]));
+            return Ok(err_text(format!("count must be > 0, got {}", count)));
         }
         if count > MAX_READ_BYTES {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
+            return Ok(err_text(format!(
                 "count {} exceeds maximum of {} bytes",
                 count, MAX_READ_BYTES
-            ))]));
+            )));
         }
 
         let mut args = serde_json::json!({
-            "memoryReference": request.0.inner.memory_reference,
+            "memoryReference": memory_reference,
             "count": count,
         });
-        if let Some(offset) = request.0.inner.offset {
+        if let Some(offset) = offset {
             args["offset"] = serde_json::json!(offset);
         }
 
-        match client
-            .send_dap_request("readMemory", Some(args), false, default_timeout())
-            .await
-        {
-            Ok(result) => match &result.body {
-                ResponseBody::ReadMemory(Some(body)) => match format_memory_read(body) {
-                    Ok(text) => Ok(CallToolResult::success(vec![Content::text(text)])),
-                    Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                        "Error decoding memory response: {}",
-                        e
-                    ))])),
+        Ok(
+            match client
+                .send_dap_request("readMemory", Some(args), false, default_timeout())
+                .await
+            {
+                Ok(result) => match &result.body {
+                    ResponseBody::ReadMemory(Some(body)) => match format_memory_read(body) {
+                        Ok(text) => ok_text(text),
+                        Err(e) => err_text(format!("Error decoding memory response: {}", e)),
+                    },
+                    ResponseBody::ReadMemory(None) => {
+                        ok_text("No memory data returned by the debug adapter.")
+                    }
+                    _ => ok_text(result.render()),
                 },
-                ResponseBody::ReadMemory(None) => Ok(CallToolResult::success(vec![Content::text(
-                    "No memory data returned by the debug adapter.",
-                )])),
-                _ => Ok(CallToolResult::success(vec![Content::text(
-                    result.render(),
-                )])),
+                Err(e) => err_text(format!("Error reading memory: {:#}", e)),
             },
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error reading memory: {:#}",
-                e
-            ))])),
-        }
+        )
     }
 
     #[tool(
@@ -1189,55 +1162,58 @@ Response is JSON from the debug adapter."#
         &self,
         request: Parameters<SessionTargeted<WriteMemoryRequest>>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = match self.get_client_or_error(request.0.session_id.as_ref()) {
+        let Parameters(SessionTargeted {
+            session_id,
+            inner:
+                WriteMemoryRequest {
+                    memory_reference,
+                    data,
+                    offset,
+                },
+        }) = request;
+        let client = match self.get_client_or_error(session_id.as_ref()) {
             Ok(c) => c,
             Err(e) => return Ok(e),
         };
 
         // Convert user-provided hex string to base64 for DAP protocol
-        let raw_bytes = match hex_string_to_bytes(&request.0.inner.data) {
+        let raw_bytes = match hex_string_to_bytes(&data) {
             Ok(bytes) => bytes,
             Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!("{e:#}"))]));
+                return Ok(err_text(format!("{e:#}")));
             }
         };
         let b64_data = base64::engine::general_purpose::STANDARD.encode(&raw_bytes);
 
         let mut args = serde_json::json!({
-            "memoryReference": request.0.inner.memory_reference,
+            "memoryReference": memory_reference,
             "data": b64_data,
         });
-        if let Some(offset) = request.0.inner.offset {
+        if let Some(offset) = offset {
             args["offset"] = serde_json::json!(offset);
         }
 
-        match client
-            .send_dap_request("writeMemory", Some(args), false, default_timeout())
-            .await
-        {
-            Ok(result) => match &result.body {
-                ResponseBody::WriteMemory(Some(body)) => {
-                    let written = body.bytes_written.unwrap_or(raw_bytes.len() as i64);
-                    Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Successfully wrote {} byte(s) to {}.",
-                        written, request.0.inner.memory_reference
-                    ))]))
-                }
-                ResponseBody::WriteMemory(None) => {
-                    Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Write completed to {}.",
-                        request.0.inner.memory_reference
-                    ))]))
-                }
-                _ => Ok(CallToolResult::success(vec![Content::text(
-                    result.render(),
-                )])),
+        Ok(
+            match client
+                .send_dap_request("writeMemory", Some(args), false, default_timeout())
+                .await
+            {
+                Ok(result) => match &result.body {
+                    ResponseBody::WriteMemory(Some(body)) => {
+                        let written = body.bytes_written.unwrap_or(raw_bytes.len() as i64);
+                        ok_text(format!(
+                            "Successfully wrote {} byte(s) to {}.",
+                            written, memory_reference
+                        ))
+                    }
+                    ResponseBody::WriteMemory(None) => {
+                        ok_text(format!("Write completed to {}.", memory_reference))
+                    }
+                    _ => ok_text(result.render()),
+                },
+                Err(e) => err_text(format!("Error writing memory: {:#}", e)),
             },
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error writing memory: {:#}",
-                e
-            ))])),
-        }
+        )
     }
 
     #[tool(
@@ -1250,7 +1226,11 @@ Response is JSON from the debug adapter."#
         use futures::stream::StreamExt;
         use futures::stream::{self};
 
-        let client = match self.get_client_or_error(request.0.session_id.as_ref()) {
+        let Parameters(SessionTargeted {
+            session_id,
+            inner: req,
+        }) = request;
+        let client = match self.get_client_or_error(session_id.as_ref()) {
             Ok(c) => c,
             Err(e) => return Ok(e),
         };
@@ -1258,14 +1238,10 @@ Response is JSON from the debug adapter."#
         let threads_result = match client.threads().await {
             Ok(r) => r.result,
             Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Error getting threads: {}",
-                    e
-                ))]));
+                return Ok(err_text(format!("Error getting threads: {}", e)));
             }
         };
 
-        let req = &request.0.inner;
         let stack_depth = req.stack_depth.clamp(1, MAX_STACK_DEPTH);
         let max_threads = (req.max_threads.max(1) as usize).min(MAX_THREADS_HARD_CAP);
 
@@ -1327,10 +1303,9 @@ Response is JSON from the debug adapter."#
             "threads": entries,
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&response)
-                .expect("serde_json::Value always serializes successfully"),
-        )]))
+        Ok(ok_text(serde_json::to_string_pretty(&response).expect(
+            "serde_json::Value always serializes successfully",
+        )))
     }
 }
 
