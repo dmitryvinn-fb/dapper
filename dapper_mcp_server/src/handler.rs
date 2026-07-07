@@ -96,7 +96,7 @@ pub struct EmptyParams {}
 pub struct SessionTargeted<T> {
     /// Id of the debug session to send the request to. If left unspecified, requests are sent to the last session this MCP server used (if still active), or the oldest active session otherwise.
     #[serde(default)]
-    #[schemars(schema_with = "optional_string_schema")]
+    #[schemars(schema_with = "optional_schema::<String>")]
     session_id: Option<SessionId>,
     #[serde(flatten)]
     pub inner: T,
@@ -109,11 +109,11 @@ pub struct StackTraceRequest {
     thread_id: ThreadId,
     /// The index of the first frame to return. If omitted, frames start at index 0.
     #[serde(default, deserialize_with = "deserialize_optional_string_or_int")]
-    #[schemars(schema_with = "optional_integer_schema")]
+    #[schemars(schema_with = "optional_schema::<i64>")]
     start_frame: Option<i64>,
     /// Maximum number of stack frames to return. If not specified, uses the configured default. Set to 0 to return all frames.
     #[serde(default, deserialize_with = "deserialize_optional_string_or_int")]
-    #[schemars(schema_with = "optional_integer_schema")]
+    #[schemars(schema_with = "optional_schema::<i64>")]
     levels: Option<i64>,
 }
 
@@ -151,7 +151,7 @@ pub struct NavigateRequest {
     navigation_type: NavigationType,
     /// When true, only the specified thread is resumed; other suspended threads remain paused. Requires the adapter to advertise `supportsSingleThreadExecutionRequests`. If omitted or false, all threads are resumed.
     #[serde(default)]
-    #[schemars(schema_with = "optional_boolean_schema")]
+    #[schemars(schema_with = "optional_schema::<bool>")]
     single_thread: Option<bool>,
 }
 
@@ -177,11 +177,11 @@ impl JsonSchema for BreakpointSpec {
             line: i64,
             /// An optional expression that controls when a breakpoint is hit. The breakpoint only stops execution when this expression evaluates to true.
             #[serde(default)]
-            #[schemars(schema_with = "optional_string_schema")]
+            #[schemars(schema_with = "optional_schema::<String>")]
             condition: Option<String>,
             /// If specified, the debugger will log this message instead of stopping at the breakpoint. Expressions within {} are interpolated.
             #[serde(default)]
-            #[schemars(rename = "logMessage", schema_with = "optional_string_schema")]
+            #[schemars(rename = "logMessage", schema_with = "optional_schema::<String>")]
             log_message: Option<String>,
         }
         BreakpointSpecSchema::json_schema(generator)
@@ -290,7 +290,7 @@ pub struct EvaluateRequest {
     expression: String,
     /// The stack frame in which to evaluate the expression. If omitted, the expression is evaluated in the global scope. To obtain frame ids, call `debug_stack_trace_command` first.
     #[serde(default)]
-    #[schemars(schema_with = "optional_integer_schema")]
+    #[schemars(schema_with = "optional_schema::<i64>")]
     frame_id: Option<FrameId>,
 }
 
@@ -360,7 +360,7 @@ pub struct ReadMemoryRequest {
     count: i64,
     /// Byte offset from the memory reference.
     #[serde(default, deserialize_with = "deserialize_optional_string_or_int")]
-    #[schemars(schema_with = "optional_integer_schema")]
+    #[schemars(schema_with = "optional_schema::<i64>")]
     offset: Option<i64>,
 }
 
@@ -372,7 +372,7 @@ pub struct WriteMemoryRequest {
     data: String,
     /// Byte offset from the memory reference.
     #[serde(default, deserialize_with = "deserialize_optional_string_or_int")]
-    #[schemars(schema_with = "optional_integer_schema")]
+    #[schemars(schema_with = "optional_schema::<i64>")]
     offset: Option<i64>,
 }
 
@@ -1660,21 +1660,12 @@ fn type_array_to_any_of(schema: &mut Schema) {
     }
 }
 
-fn optional_integer_schema(generator: &mut SchemaGenerator) -> Schema {
-    let mut schema = Option::<i64>::json_schema(generator);
+/// Schema for `Option<T>` fields: strips the `format` annotation (a no-op
+/// for types without one) and converts the `"type": [T, "null"]` array to
+/// the `anyOf` form. Use as `schema_with = "optional_schema::<i64>"`.
+fn optional_schema<T: JsonSchema>(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = Option::<T>::json_schema(generator);
     schema.remove("format");
-    type_array_to_any_of(&mut schema);
-    schema
-}
-
-fn optional_string_schema(generator: &mut SchemaGenerator) -> Schema {
-    let mut schema = Option::<String>::json_schema(generator);
-    type_array_to_any_of(&mut schema);
-    schema
-}
-
-fn optional_boolean_schema(generator: &mut SchemaGenerator) -> Schema {
-    let mut schema = Option::<bool>::json_schema(generator);
     type_array_to_any_of(&mut schema);
     schema
 }
