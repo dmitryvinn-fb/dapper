@@ -740,8 +740,8 @@ async fn set_exception_breakpoints_rejects_empty_filters_without_clear() {
         "expected tool error for empty filters + !clear_existing"
     );
     let text = match result.content.first() {
-        Some(c) => match &c.raw {
-            rmcp::model::RawContent::Text(t) => t.text.as_str(),
+        Some(c) => match c {
+            rmcp::model::ContentBlock::Text(t) => t.text.as_str(),
             other => panic!("expected text content, got {other:?}"),
         },
         None => panic!("expected at least one content block"),
