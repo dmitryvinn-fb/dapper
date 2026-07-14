@@ -682,9 +682,7 @@ Example:
                     "debugger_args": session.debugger_args,
                     "dapper_config": self.config,
                 });
-                ok_text(
-                    serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
-                )
+                ok_text(format!("{:#}", output))
             }
             Err(e) => err_text(format!("Error resolving session: {:#}", e)),
         })
@@ -1024,9 +1022,7 @@ Response is JSON from the debug adapter."#
             "threads": entries,
         });
 
-        Ok(ok_text(serde_json::to_string_pretty(&response).expect(
-            "serde_json::Value always serializes successfully",
-        )))
+        Ok(ok_text(format!("{:#}", response)))
     }
 }
 
