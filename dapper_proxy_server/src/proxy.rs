@@ -222,10 +222,6 @@ impl ProxyServer {
         )
     }
 
-    pub fn get_debug_session_tracker(&self) -> DebugSessionTracker {
-        self.debug_session_tracker.clone()
-    }
-
     pub async fn run(self, main_client: DAPClient) -> anyhow::Result<()> {
         let (main_client_read, main_client_write) = main_client.into_channels();
 
