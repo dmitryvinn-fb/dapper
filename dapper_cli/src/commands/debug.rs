@@ -316,10 +316,7 @@ impl Debug {
                     "debugger_args": session.debugger_args,
                     "dapper_config": config,
                 });
-                try_println(format_args!(
-                    "{}",
-                    serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string())
-                ))?;
+                try_println(format_args!("{:#}", output))?;
             }
             DebugCommands::Stop {} => {
                 client.stop().await?;
