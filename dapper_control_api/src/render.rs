@@ -58,15 +58,14 @@ fn render_with_envelope(
     context: Option<&ResponseContext>,
     config: &DapperConfig,
 ) -> String {
-    let header = if config.context.show_session {
-        context
-            .and_then(|ctx| ctx.session.as_ref())
-            .map(|info| format_context_header(Some(info)))
-    } else {
-        None
-    };
+    let view =
+        context.map(|ctx| ResponseContextOutput::from_response_context(ctx, &config.context));
 
-    let footer = context.and_then(|ctx| format_context_footer(ctx, &config.context));
+    let header = view
+        .as_ref()
+        .and_then(|v| v.session.as_ref())
+        .map(format_context_header);
+    let footer = view.as_ref().and_then(format_context_footer);
 
     format_envelope(text, header.as_deref(), footer.as_deref())
 }

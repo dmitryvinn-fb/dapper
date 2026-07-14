@@ -3,105 +3,84 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root directory of this source tree.
 
+//! Plaintext presentation of a [`ResponseContextOutput`].
+//!
+//! All filtering, sorting, and truncation *policy* (config gating,
+//! `max_source_files`, defensive sorts, output-event bounds) lives in
+//! `response_context_output` — the single shaping step shared with JSON
+//! output. This module only turns the already-shaped view into text, so
+//! plaintext and JSON can never disagree on *what* is shown, only on how
+//! it looks.
+
 use std::fmt::Write;
 
-use dapper_config::ContextConfig;
-use dapper_session::RequestType;
-use dapper_session::SessionInfo;
+use crate::response_context_output::OutputEventEntry;
+use crate::response_context_output::OutputSummary;
+use crate::response_context_output::ResponseContextOutput;
+use crate::response_context_output::SessionInfoOutput;
 
-use crate::ExceptionFilterEntry;
-use crate::OutputEvent;
-use crate::ResponseContext;
+pub(crate) fn format_context_header(session: &SessionInfoOutput) -> String {
+    let mut parts = vec![format!("Session: {}", session.session_id)];
 
-pub fn format_context_header(session_info: Option<&SessionInfo>) -> String {
-    let Some(info) = session_info else {
-        return String::new();
-    };
-
-    let mut parts = vec![format!("Session: {}", info.session_id)];
-
-    if let Some(session_type) = &info.session_type {
-        parts.push(format!("Debugger: {}", session_type));
+    if let Some(debugger) = session.debugger {
+        parts.push(format!("Debugger: {}", debugger));
     }
 
-    if let Some(request_type) = info.request_type {
+    if let Some(request_type) = session.request_type {
         parts.push(format!("Type: {}", request_type));
-
-        match request_type {
-            RequestType::Launch => {
-                if let Some(program) = &info.program_path {
-                    parts.push(format!("Program: {}", program));
-                }
-            }
-            RequestType::Attach => {
-                if let Some(pid) = info.debuggee_process_id {
-                    parts.push(format!("PID: {}", pid));
-                }
-            }
-        }
+    }
+    if let Some(program) = session.program {
+        parts.push(format!("Program: {}", program));
+    }
+    if let Some(pid) = session.pid {
+        parts.push(format!("PID: {}", pid));
     }
 
     parts.join(" | ")
 }
 
+/// Presentation-only cap on a single output line in plaintext. The JSON
+/// output carries the full line.
 const MAX_OUTPUT_LINE_LENGTH: usize = 150;
 
-pub fn format_context_footer(context: &ResponseContext, config: &ContextConfig) -> Option<String> {
+pub(crate) fn format_context_footer(view: &ResponseContextOutput) -> Option<String> {
     let mut result = String::new();
 
-    if config.show_sessions && !context.other_sessions.is_empty() {
+    if !view.other_sessions.is_empty() {
         let _ = writeln!(
             result,
             "Other active debug sessions ({}):",
-            context.other_sessions.len()
+            view.other_sessions.len()
         );
-        for session in &context.other_sessions {
-            let _ = writeln!(result, "  - {}", session.session_id);
+        for session_id in &view.other_sessions {
+            let _ = writeln!(result, "  - {}", session_id);
         }
         result.push('\n');
     }
 
-    if config.show_execution_state
-        && let Some(ref versioned) = context.execution_state
-    {
-        result.push_str(&versioned.state.format_summary());
+    if let Some(state) = view.execution_state {
+        result.push_str(&state.format_summary());
     }
 
-    if config.show_breakpoints && !context.breakpoints.is_empty() {
-        let mut files: Vec<_> = context.breakpoints.keys().collect();
-        files.sort();
-
-        let showing = files.len().min(config.max_source_files);
-
-        if showing < files.len() {
+    if let Some(ref breakpoints) = view.breakpoints {
+        if breakpoints.truncated {
             let _ = writeln!(
                 result,
                 "Source-line breakpoints (only showing first {}):",
-                showing
+                breakpoints.shown_files
             );
         } else {
             result.push_str("Source-line breakpoints:\n");
         }
 
-        for file in &files[..showing] {
-            let mut lines: Vec<i64> = context.breakpoints[*file]
-                .iter()
-                .map(|bp| bp.line)
-                .collect();
-            lines.sort();
-            let _ = writeln!(result, "  {}: lines {:?}", file, lines);
+        for file in &breakpoints.files {
+            let _ = writeln!(result, "  {}: lines {:?}", file.path, file.lines);
         }
     }
 
-    if config.show_exception_breakpoints && !context.installed_exception_filters.is_empty() {
-        // Tracker stores entries sorted by filter id; sort defensively here
-        // too in case a future tracker refactor relaxes that invariant.
-        let mut entries: Vec<&ExceptionFilterEntry> =
-            context.installed_exception_filters.iter().collect();
-        entries.sort_unstable_by(|a, b| a.filter.cmp(&b.filter));
-
+    if let Some(ref filters) = view.installed_exception_filters {
         result.push_str("Exception breakpoints:\n");
-        for entry in entries {
+        for entry in &filters.filters {
             match &entry.condition {
                 Some(cond) => {
                     let _ = writeln!(result, "  {} (condition: {})", entry.filter, cond);
@@ -113,21 +92,17 @@ pub fn format_context_footer(context: &ResponseContext, config: &ContextConfig) 
         }
     }
 
-    if config.max_output_lines > 0 && !context.output.is_empty() {
+    if let Some(ref output) = view.output {
         let _ = writeln!(
             result,
             "\nNew output ({} events since last response):",
-            context.output.total_count
+            output.total_count
         );
 
-        format_output_events(&context.output, &mut result);
+        format_output_events(output, &mut result);
 
-        if let Some(ref path) = context.output_history_file {
-            let _ = writeln!(
-                result,
-                "\nFull output history available at: {}",
-                path.display()
-            );
+        if let Some(ref path) = output.output_history_file {
+            let _ = writeln!(result, "\nFull output history available at: {}", path);
         }
     }
 
@@ -138,27 +113,25 @@ pub fn format_context_footer(context: &ResponseContext, config: &ContextConfig) 
     }
 }
 
-fn format_output_events(output: &crate::BufferedOutput, result: &mut String) {
-    for event in &output.head {
+fn format_output_events(output: &OutputSummary, result: &mut String) {
+    // The events list is the buffer's head followed by its tail.
+    let (head, tail) = output.events.split_at(output.head_count);
+
+    for event in head {
         format_output_event(event, result);
     }
 
-    let buffered_count = output.head.len() + output.tail.len();
-    if output.total_count > buffered_count {
-        let skipped = output.total_count - buffered_count;
+    if output.truncated {
+        let skipped = output.total_count - output.shown_events;
         let _ = write!(result, "\n... ({} events omitted) ...\n\n", skipped);
     }
 
-    for event in &output.tail {
+    for event in tail {
         format_output_event(event, result);
     }
 }
 
-fn format_output_event(event: &OutputEvent, result: &mut String) {
-    let category_str = event
-        .category
-        .as_ref()
-        .map_or("unspecified", |c| c.as_ref());
+fn format_output_event(event: &OutputEventEntry, result: &mut String) {
     for line in event.output.lines() {
         let (display, suffix) = if line.len() > MAX_OUTPUT_LINE_LENGTH {
             (
@@ -171,12 +144,12 @@ fn format_output_event(event: &OutputEvent, result: &mut String) {
         let _ = writeln!(
             result,
             "[seq:{} {}] {}{}",
-            event.seq, category_str, display, suffix
+            event.seq, event.category, display, suffix
         );
     }
 }
 
-pub fn format_envelope(result: &str, header: Option<&str>, footer: Option<&str>) -> String {
+pub(crate) fn format_envelope(result: &str, header: Option<&str>, footer: Option<&str>) -> String {
     let mut output = String::new();
 
     if let Some(header) = header {
@@ -200,9 +173,12 @@ pub fn format_envelope(result: &str, header: Option<&str>, footer: Option<&str>)
 mod tests {
     use std::collections::HashMap;
 
+    use dapper_config::ContextConfig;
     use dapper_dap_protocol::data_types::ThreadId;
     use dapper_dap_protocol::enums::OutputCategory;
     use dapper_dap_protocol::enums::StoppedReason;
+    use dapper_session::RequestType;
+    use dapper_session::SessionInfo;
 
     use super::*;
     use crate::BreakpointInfo;
@@ -210,6 +186,8 @@ mod tests {
     use crate::ExceptionFilterEntry;
     use crate::ExecutionStateSummary;
     use crate::ExecutionStatus;
+    use crate::OutputEvent;
+    use crate::ResponseContext;
     use crate::VersionedExecutionStateSummary;
 
     fn make_session_info(session_id: &str) -> SessionInfo {
@@ -230,10 +208,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn format_context_header_without_session_info() {
-        let output = format_context_header(None);
-        assert_eq!(output, "");
+    fn header_for(info: &SessionInfo) -> String {
+        format_context_header(&SessionInfoOutput::from_session_info(info))
+    }
+
+    /// Shape the context exactly as production does, then render the footer.
+    fn footer_for(ctx: &ResponseContext, config: &ContextConfig) -> Option<String> {
+        let view = ResponseContextOutput::from_response_context(ctx, config);
+        format_context_footer(&view)
     }
 
     #[test]
@@ -243,7 +225,7 @@ mod tests {
         info.request_type = Some(RequestType::Launch);
         info.program_path = Some("/path/to/main.py".to_string());
 
-        let output = format_context_header(Some(&info));
+        let output = header_for(&info);
         assert!(output.contains("Session: abc-123"));
         assert!(output.contains("Debugger: debugpy"));
         assert!(output.contains("Type: launch"));
@@ -257,7 +239,7 @@ mod tests {
         info.request_type = Some(RequestType::Attach);
         info.debuggee_process_id = Some(12345);
 
-        let output = format_context_header(Some(&info));
+        let output = header_for(&info);
         assert!(output.contains("Session: def-456"));
         assert!(output.contains("Debugger: cppdbg"));
         assert!(output.contains("Type: attach"));
@@ -267,8 +249,7 @@ mod tests {
     #[test]
     fn format_context_header_minimal_session_info() {
         let info = make_session_info("min-session");
-        let output = format_context_header(Some(&info));
-        assert_eq!(output, "Session: min-session");
+        assert_eq!(header_for(&info), "Session: min-session");
     }
 
     fn empty_context() -> ResponseContext {
@@ -282,7 +263,7 @@ mod tests {
     #[test]
     fn format_context_footer_empty() {
         let ctx = empty_context();
-        assert!(format_context_footer(&ctx, &default_context_config()).is_none());
+        assert!(footer_for(&ctx, &default_context_config()).is_none());
     }
 
     #[test]
@@ -290,7 +271,7 @@ mod tests {
         let mut ctx = empty_context();
         ctx.other_sessions = vec![make_session_info("other-1"), make_session_info("other-2")];
 
-        let output = format_context_footer(&ctx, &default_context_config()).unwrap();
+        let output = footer_for(&ctx, &default_context_config()).unwrap();
         assert!(output.contains("Other active debug sessions (2):"));
         assert!(output.contains("  - other-1"));
         assert!(output.contains("  - other-2"));
@@ -310,7 +291,7 @@ mod tests {
             },
         });
 
-        let output = format_context_footer(&ctx, &default_context_config()).unwrap();
+        let output = footer_for(&ctx, &default_context_config()).unwrap();
         assert!(output.contains("execution status: stopped"));
         assert!(output.contains("Stop reason: breakpoint"));
         assert!(output.contains("Thread: 5"));
@@ -339,7 +320,7 @@ mod tests {
             ],
         );
 
-        let output = format_context_footer(&ctx, &default_context_config()).unwrap();
+        let output = footer_for(&ctx, &default_context_config()).unwrap();
         assert!(output.contains("Source-line breakpoints:"));
         assert!(output.contains("/path/to/file.py: lines [10, 20]"));
     }
@@ -363,7 +344,7 @@ mod tests {
             max_source_files: 5,
             ..Default::default()
         };
-        let output = format_context_footer(&ctx, &config).unwrap();
+        let output = footer_for(&ctx, &config).unwrap();
         assert!(output.contains("only showing first 5"));
     }
 
@@ -383,7 +364,7 @@ mod tests {
         };
         ctx.output_history_file = Some(std::path::PathBuf::from("/tmp/output.log"));
 
-        let output = format_context_footer(&ctx, &default_context_config()).unwrap();
+        let output = footer_for(&ctx, &default_context_config()).unwrap();
         assert!(output.contains("New output (1 events since last response):"));
         assert!(output.contains("[seq:10 stdout] Hello, World!"));
         assert!(output.contains("Full output history available at: /tmp/output.log"));
@@ -426,7 +407,7 @@ mod tests {
         };
 
         let config = ContextConfig::default();
-        let output = format_context_footer(&ctx, &config).unwrap();
+        let output = footer_for(&ctx, &config).unwrap();
         assert!(output.contains("[seq:0 stdout] line 0"));
         assert!(output.contains("[seq:1 stdout] line 1"));
         assert!(output.contains("6 events omitted"));
@@ -434,89 +415,47 @@ mod tests {
         assert!(output.contains("[seq:9 stdout] line 9"));
     }
 
-    #[test]
-    fn format_output_events_with_prebounded_buffer() {
-        let output = BufferedOutput {
-            head: vec![
-                OutputEvent {
-                    seq: 1.into(),
-                    category: Some(OutputCategory::Stdout),
-                    output: "first".to_string(),
-                    ..Default::default()
-                },
-                OutputEvent {
-                    seq: 2.into(),
-                    category: Some(OutputCategory::Stdout),
-                    output: "second".to_string(),
-                    ..Default::default()
-                },
-            ],
-            tail: vec![
-                OutputEvent {
-                    seq: 9.into(),
-                    category: Some(OutputCategory::Stdout),
-                    output: "ninth".to_string(),
-                    ..Default::default()
-                },
-                OutputEvent {
-                    seq: 10.into(),
-                    category: Some(OutputCategory::Stdout),
-                    output: "tenth".to_string(),
-                    ..Default::default()
-                },
-            ],
-            total_count: 10,
-            ..Default::default()
-        };
-
-        let mut result = String::new();
-        format_output_events(&output, &mut result);
-
-        assert!(result.contains("[seq:1 stdout] first"));
-        assert!(result.contains("[seq:2 stdout] second"));
-        assert!(result.contains("6 events omitted"));
-        assert!(result.contains("[seq:9 stdout] ninth"));
-        assert!(result.contains("[seq:10 stdout] tenth"));
-    }
-
+    /// The omission marker must sit between the buffer's head and tail,
+    /// and disappear when the buffer holds every event.
     #[test]
     fn format_output_events_no_omission_at_capacity() {
-        let output = BufferedOutput {
-            head: vec![
-                OutputEvent {
-                    seq: 1.into(),
-                    category: Some(OutputCategory::Stdout),
-                    output: "first".to_string(),
-                    ..Default::default()
-                },
-                OutputEvent {
-                    seq: 2.into(),
-                    category: Some(OutputCategory::Stdout),
-                    output: "second".to_string(),
-                    ..Default::default()
-                },
-            ],
-            tail: vec![
-                OutputEvent {
-                    seq: 3.into(),
-                    category: Some(OutputCategory::Stdout),
-                    output: "third".to_string(),
-                    ..Default::default()
-                },
-                OutputEvent {
-                    seq: 4.into(),
-                    category: Some(OutputCategory::Stdout),
-                    output: "fourth".to_string(),
-                    ..Default::default()
-                },
-            ],
-            total_count: 4,
+        let ctx = ResponseContext {
+            output: BufferedOutput {
+                head: vec![
+                    OutputEvent {
+                        seq: 1.into(),
+                        category: Some(OutputCategory::Stdout),
+                        output: "first".to_string(),
+                        ..Default::default()
+                    },
+                    OutputEvent {
+                        seq: 2.into(),
+                        category: Some(OutputCategory::Stdout),
+                        output: "second".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                tail: vec![
+                    OutputEvent {
+                        seq: 3.into(),
+                        category: Some(OutputCategory::Stdout),
+                        output: "third".to_string(),
+                        ..Default::default()
+                    },
+                    OutputEvent {
+                        seq: 4.into(),
+                        category: Some(OutputCategory::Stdout),
+                        output: "fourth".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                total_count: 4,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
-        let mut result = String::new();
-        format_output_events(&output, &mut result);
-
+        let result = footer_for(&ctx, &default_context_config()).unwrap();
         assert!(result.contains("[seq:1 stdout] first"));
         assert!(result.contains("[seq:2 stdout] second"));
         assert!(result.contains("[seq:3 stdout] third"));
@@ -527,7 +466,7 @@ mod tests {
     #[test]
     fn format_output_event_should_handle_multibyte_utf8_truncation() {
         // Regression test for a production crash where box-drawing characters
-        // (━ = \u2501, 3 bytes in UTF-8) caused &line[..150] to land
+        // (━ = U+2501, 3 bytes in UTF-8) caused &line[..150] to land
         // mid-character, panicking and poisoning the session tracker mutex.
         //
         // Layout: "│ ┏" (7 bytes) + 50×"━" (150 bytes) = 157 bytes total.
@@ -537,11 +476,10 @@ mod tests {
         assert!(line.len() > MAX_OUTPUT_LINE_LENGTH);
         assert!(!line.is_char_boundary(MAX_OUTPUT_LINE_LENGTH));
 
-        let event = OutputEvent {
+        let event = OutputEventEntry {
             seq: 1.into(),
-            category: Some(OutputCategory::Stdout),
-            output: line,
-            ..Default::default()
+            category: "stdout",
+            output: &line,
         };
 
         let mut result = String::new();
@@ -603,7 +541,7 @@ mod tests {
             ..Default::default()
         };
         let config = ContextConfig::default();
-        let footer = format_context_footer(&ctx, &config).expect("footer should be Some");
+        let footer = footer_for(&ctx, &config).expect("footer should be Some");
         // Defensive sort means raised renders before uncaught regardless of input order.
         assert!(
             footer.contains("Exception breakpoints:\n  raised (condition: x>5)\n  uncaught\n"),
@@ -631,7 +569,7 @@ mod tests {
             ..Default::default()
         };
         let config = ContextConfig::default();
-        let footer = format_context_footer(&ctx, &config).expect("footer should be Some");
+        let footer = footer_for(&ctx, &config).expect("footer should be Some");
         // Source-line block first, then exception block, both terminated
         // by their own newlines from `writeln!`.
         assert!(
@@ -666,7 +604,7 @@ mod tests {
         };
         // Footer should be empty (no other content either) — exception
         // filters are the only data, and we asked for them not to be shown.
-        let footer = format_context_footer(&ctx, &config);
+        let footer = footer_for(&ctx, &config);
         assert!(
             footer.is_none(),
             "expected no footer when show_exception_breakpoints=false, got: {footer:?}"

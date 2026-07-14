@@ -262,6 +262,10 @@ pub struct OutputSummary<'a> {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_history_file: Option<String>,
+
+    /// Where `events` splits into head and tail.
+    #[serde(skip)]
+    pub head_count: usize,
 }
 
 impl<'a> OutputSummary<'a> {
@@ -288,6 +292,7 @@ impl<'a> OutputSummary<'a> {
                 .output_history_file
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            head_count: context.output.head.len(),
         })
     }
 }

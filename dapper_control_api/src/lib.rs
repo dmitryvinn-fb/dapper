@@ -21,9 +21,9 @@ mod output_event;
 pub use output_event::BufferedOutput;
 pub use output_event::OutputEvent;
 
-pub mod envelope;
+mod envelope;
 
-pub mod response_context_output;
+mod response_context_output;
 
 mod execution_state_summary;
 pub use execution_state_summary::ExecutionStateSummary;
