@@ -198,6 +198,20 @@ impl ProxyClient {
         }
     }
 
+    /// Send `request`, wait for its response, and verify success — the
+    /// round trip every command shares. Returns the response together with
+    /// the listener stream for callers that keep waiting for events after
+    /// the response (e.g. navigate).
+    async fn round_trip(
+        &self,
+        request: dap::Request,
+    ) -> anyhow::Result<(dap::Response, broadcast::Receiver<Arc<dap::Message>>)> {
+        let ListenerPayload { seq, mut messages } = self.send_message(request.into()).await?;
+        let response = helpers::wait_for_response(seq, &mut messages).await?;
+        response.check_success()?;
+        Ok((response, messages))
+    }
+
     pub async fn repl(&self, cmd: String, frame_id: Option<FrameId>) -> anyhow::Result<String> {
         let request = dap::Request::new(RequestCommand::Evaluate(EvaluateArguments {
             expression: cmd,
@@ -206,10 +220,7 @@ impl ProxyClient {
             ..Default::default()
         }));
 
-        let ListenerPayload { seq, mut messages } = self.send_message(request.into()).await?;
-        let response = helpers::wait_for_response(seq, &mut messages).await?;
-
-        response.check_success()?;
+        let (response, _) = self.round_trip(request).await?;
 
         // Extract result from the response body
         let result = match response.body {
@@ -223,10 +234,7 @@ impl ProxyClient {
     pub async fn threads(&self) -> anyhow::Result<dapper_session::ThreadsResult> {
         let request = dap::Request::new(RequestCommand::Threads);
 
-        let ListenerPayload { seq, mut messages } = self.send_message(request.into()).await?;
-        let response = helpers::wait_for_response(seq, &mut messages).await?;
-
-        response.check_success()?;
+        let (response, _) = self.round_trip(request).await?;
 
         let threads = match response.body {
             ResponseBody::Threads(body) => body.threads,
@@ -266,10 +274,7 @@ impl ProxyClient {
             ..Default::default()
         }));
 
-        let ListenerPayload { seq, mut messages } = self.send_message(request.into()).await?;
-        let response = helpers::wait_for_response(seq, &mut messages).await?;
-
-        response.check_success()?;
+        let (response, _) = self.round_trip(request).await?;
 
         let all_frames = match response.body {
             ResponseBody::StackTrace(body) => body.stack_frames,
@@ -305,10 +310,7 @@ impl ProxyClient {
             ..Default::default()
         }));
 
-        let ListenerPayload { seq, mut messages } = self.send_message(request.into()).await?;
-        let response = helpers::wait_for_response(seq, &mut messages).await?;
-
-        response.check_success()?;
+        let (response, _) = self.round_trip(request).await?;
 
         let scopes = match response.body {
             ResponseBody::Scopes(body) => body.scopes,
@@ -349,10 +351,7 @@ impl ProxyClient {
             ..Default::default()
         }));
 
-        let ListenerPayload { seq, mut messages } = self.send_message(request.into()).await?;
-        let response = helpers::wait_for_response(seq, &mut messages).await?;
-
-        response.check_success()?;
+        let (response, _) = self.round_trip(request).await?;
 
         let variables = match response.body {
             ResponseBody::Variables(body) => body.variables,
@@ -379,10 +378,7 @@ impl ProxyClient {
             ..Default::default()
         }));
 
-        let ListenerPayload { seq, mut messages } = self.send_message(request.into()).await?;
-        let response = helpers::wait_for_response(seq, &mut messages).await?;
-
-        response.check_success()?;
+        let (response, _) = self.round_trip(request).await?;
 
         let body = match response.body {
             ResponseBody::SetVariable(body) => body,
@@ -457,10 +453,7 @@ impl ProxyClient {
             navigation_type.to_request_command(thread_id, effective_single_thread),
         );
 
-        let ListenerPayload { seq, mut messages } = self.send_message(request.into()).await?;
-        let response = helpers::wait_for_response(seq, &mut messages).await?;
-
-        response.check_success()?;
+        let (_, mut messages) = self.round_trip(request).await?;
 
         let (timeout, timeout_seconds) = match navigation_type {
             NavigationType::Pause => (
@@ -585,11 +578,7 @@ impl ProxyClient {
             ..Default::default()
         }));
 
-        let ListenerPayload { seq, mut messages } = self.send_message(request.into()).await?;
-
-        let response = helpers::wait_for_response(seq, &mut messages).await?;
-
-        response.check_success()?;
+        let (response, _) = self.round_trip(request).await?;
 
         let ResponseBody::SetBreakpoints(bp_body) = &response.body else {
             let error_msg = format!(
@@ -756,9 +745,7 @@ impl ProxyClient {
         let (request, effective) =
             build_set_exception_breakpoints_request(&merged_vec, Some(&caps));
 
-        let ListenerPayload { seq, mut messages } = self.send_message(request.into()).await?;
-        let response = helpers::wait_for_response(seq, &mut messages).await?;
-        response.check_success()?;
+        self.round_trip(request).await?;
 
         self.debug_session_tracker
             .update_exception_filters(effective.clone());
@@ -792,22 +779,16 @@ impl ProxyClient {
             extra: Default::default(),
         }));
 
-        let round_trip = async {
-            let ListenerPayload { seq, mut messages } = self.send_message(request.into()).await?;
-            let response = helpers::wait_for_response(seq, &mut messages).await?;
-            response.check_success()?;
-            anyhow::Ok((response.body, messages))
-        };
-        let (body, mut messages) =
-            tokio::time::timeout(timeout, round_trip)
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "DAP request '{}' timed out after {}s",
-                        command,
-                        timeout.as_secs()
-                    )
-                })??;
+        let (response, mut messages) = tokio::time::timeout(timeout, self.round_trip(request))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "DAP request '{}' timed out after {}s",
+                    command,
+                    timeout.as_secs()
+                )
+            })??;
+        let body = response.body;
 
         if wait_for_event {
             let event = match helpers::wait_for_events_timeout(
