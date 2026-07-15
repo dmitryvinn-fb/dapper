@@ -142,8 +142,10 @@ const config: DocusaurusConfig = {
   onBrokenLinks: 'throw',
   trailingSlash: true,
   favicon: 'img/favicon-lens.svg',
-  organizationName: 'facebookexperimental',
+  organizationName: 'dmitryvinn-fb',
   projectName: 'dapper',
+  url: 'https://dmitryvinn-fb.github.io',
+  baseUrl: '/dapper/',
   customFields: {
     sourceCodeUrl,
     sourceCodeLabel,
