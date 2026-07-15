@@ -12,7 +12,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
 
-    if: github.repository == 'dmitryvinn-fb//dapper'
+    if: github.repository == 'dmitryvinn-fb/dapper'
 
     env:
       working-directory: website
